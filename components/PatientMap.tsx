@@ -25,10 +25,37 @@ const PatientMap: React.FC<PatientMapProps> = ({
   const markersRef = useRef<any[]>([]);
   const circleRef = useRef<any>(null);
   const [isLegendOpen, setIsLegendOpen] = useState(false);
+  const [isMapLoaded, setIsMapLoaded] = useState(typeof google !== 'undefined' && !!google.maps);
+
+  // Check if google maps object is loaded, with a small interval checker
+  useEffect(() => {
+    if (isMapLoaded) return;
+
+    if (typeof google !== 'undefined' && google.maps) {
+      setIsMapLoaded(true);
+      return;
+    }
+
+    const interval = setInterval(() => {
+      if (typeof google !== 'undefined' && google.maps) {
+        setIsMapLoaded(true);
+        clearInterval(interval);
+      }
+    }, 200);
+
+    const timeout = setTimeout(() => {
+      clearInterval(interval);
+    }, 15000); // 15 seconds max timeout
+
+    return () => {
+      clearInterval(interval);
+      clearTimeout(timeout);
+    };
+  }, [isMapLoaded]);
 
   // Initialize Map - Set center to Rayong City
   useEffect(() => {
-    if (mapRef.current && !googleMap.current) {
+    if (isMapLoaded && mapRef.current && !googleMap.current) {
       googleMap.current = new google.maps.Map(mapRef.current, {
         center: { lat: 12.6814, lng: 101.2813 }, // Rayong Coordinates
         zoom: 13,
@@ -53,7 +80,7 @@ const PatientMap: React.FC<PatientMapProps> = ({
         }
       });
     }
-  }, []);
+  }, [isMapLoaded]);
 
   // Update Markers
   useEffect(() => {
@@ -122,7 +149,16 @@ const PatientMap: React.FC<PatientMapProps> = ({
 
   return (
     <div className="relative w-full h-[600px] rounded-[32px] overflow-hidden shadow-inner border-2 border-slate-200">
-      <div ref={mapRef} className="w-full h-full" />
+      {!isMapLoaded ? (
+        <div className="w-full h-full bg-slate-900 flex flex-col items-center justify-center text-slate-400 gap-3">
+          <svg className="animate-spin text-blue-500" xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+            <path d="M21 12a9 9 0 1 1-6.219-8.56"/>
+          </svg>
+          <span className="text-sm font-bold tracking-wide animate-pulse">กำลังดึงพิกัดแผนที่ดาวเทียม...</span>
+        </div>
+      ) : (
+        <div ref={mapRef} className="w-full h-full" />
+      )}
       
       {/* Collapsible Legend Overlay */}
       <div className="absolute bottom-6 right-6 flex flex-col items-end gap-2">
