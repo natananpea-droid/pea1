@@ -1,0 +1,10 @@
+{
+  "name": "LifeLine ElectriGuard - ระบบแจ้งเตือนผู้ป่วยติดเตียงช่วงไฟดับ",
+  "description": "ระบบจัดการและติดตามพิกัดผู้ป่วยติดเตียงสำหรับหน่วยงานการไฟฟ้า เพื่อเฝ้าระวังและช่วยเหลือกรณีไฟฟ้าขัดข้อง โดยเน้นการจัดลำดับความสำคัญตามความจำเป็นทางการแพทย์",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
