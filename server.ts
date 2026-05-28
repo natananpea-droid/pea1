@@ -12,8 +12,26 @@ const PORT = 3000;
 
 app.use(express.json());
 
-// Initialize Google GenAI
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// Lazy Initialize Google GenAI
+let aiInstance: GoogleGenAI | null = null;
+function getAI() {
+  if (!aiInstance) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      console.warn("GEMINI_API_KEY is not defined. Using rule-based fallback assessment.");
+      return null;
+    }
+    aiInstance = new GoogleGenAI({ 
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build'
+        }
+      }
+    });
+  }
+  return aiInstance;
+}
 
 // Real-Time Shared Database State (In-Memory on the Server)
 let patients: any[] = [];
@@ -137,6 +155,30 @@ app.post("/api/assess", async (req, res) => {
     return res.status(400).json({ error: "Condition is required" });
   }
 
+  const getFallback = () => {
+    let priority = "LOW";
+    let reason = "ระบบคำนวณสัญลักษณ์ความเสี่ยงปฐมภูมิตามข้อมูลอุปกรณ์ช่วยพยุงชีพของท่าน";
+    const eqStr = (equipment || []).join(' ').toLowerCase();
+    const condStr = condition.toLowerCase();
+    
+    if (eqStr.includes('ventilator') || eqStr.includes('ช่วยหายใจ') || condStr.includes('เครื่องช่วยหายใจ')) {
+      priority = "CRITICAL";
+      reason = "ตรวจพบความจำเป็นเร่งด่วนในการทำงานของเครื่องช่วยหายใจพยุงชีวิต";
+    } else if (eqStr.includes('oxygen') || eqStr.includes('ออกซิเจน') || eqStr.includes('suction') || eqStr.includes('เสมหะ')) {
+      priority = "HIGH";
+      reason = "พิจารณาจากการใช้อุปกรณ์พ่นออกซิเจนหรือดูดเสมหะที่มีความเสี่ยงสูงเมื่อไฟดับ";
+    } else if (eqStr.includes('เตียง') || eqStr.includes('ที่นอนลม')) {
+      priority = "MEDIUM";
+      reason = "ต้องการใช้เครื่องปรับอากาศควบคุมอุณหภูมิหรือเตียงพยาบาลไฟฟ้า";
+    }
+    return { priority, reason };
+  };
+
+  const ai = getAI();
+  if (!ai) {
+    return res.json(getFallback());
+  }
+
   const prompt = `ประเมินระดับความสำคัญของผู้ป่วยติดเตียงสำหรับหน่วยงานไฟฟ้า (PEA) 
   โดยพิจารณาจากอาการ: ${condition} และอุปกรณ์ที่ใช้: ${equipment ? equipment.join(', ') : 'ไม่มี'}
   ระดับความสำคัญ: CRITICAL (วิกฤต - ต้องใช้ไฟฟ้าตลอดเวลาเพื่อพยุงชีพ), HIGH (สูง - มีอุปกรณ์สำคัญแต่มีแบตสำรองสั้นๆ), MEDIUM (ปานกลาง), LOW (ต่ำ)
@@ -144,7 +186,7 @@ app.post("/api/assess", async (req, res) => {
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
+      model: "gemini-3.5-flash",
       contents: prompt,
       config: {
         responseMimeType: "application/json",
@@ -162,25 +204,7 @@ app.post("/api/assess", async (req, res) => {
     res.json(JSON.parse(response.text));
   } catch (err: any) {
     console.error("AI Server-side Assessment failed:", err);
-    
-    // Quality fallback algorithm
-    let priority = "LOW";
-    let reason = "ระบบ AI ไม่พร้อมใช้งานชั่วคราว จึงจัดลำดับโดยใช้หมวดหมู่คำหลักเพื่อความปลอดภัย";
-    const eqStr = (equipment || []).join(' ').toLowerCase();
-    const condStr = condition.toLowerCase();
-    
-    if (eqStr.includes('ventilator') || eqStr.includes('ช่วยหายใจ') || condStr.includes('เครื่องช่วยหายใจ')) {
-      priority = "CRITICAL";
-      reason = "ตรวจพบความจำเป็นเร่งด่วนในการทำงานของเครื่องช่วยหายใจพยุงชีวิต";
-    } else if (eqStr.includes('oxygen') || eqStr.includes('ออกซิเจน') || eqStr.includes('suction') || eqStr.includes('เสมหะ')) {
-      priority = "HIGH";
-      reason = "พิจารณาจากการใช้อุปกรณ์พ่นออกซิเจนหรือดูดเสมหะที่มีความเสี่ยงสูงเมื่อไฟดับ";
-    } else if (eqStr.includes('เตียง') || eqStr.includes('ที่นอนลม')) {
-      priority = "MEDIUM";
-      reason = "ต้องการใช้เครื่องปรับอากาศควบคุมอุณหภูมิหรือเตียงพยาบาลไฟฟ้า";
-    }
-    
-    res.json({ priority, reason });
+    res.json(getFallback());
   }
 });
 

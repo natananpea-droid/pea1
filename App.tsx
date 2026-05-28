@@ -240,7 +240,24 @@ const App: React.FC = () => {
     setIsAssessing(true);
     
     try {
-      const assessment = await assessPatientPriority(newPatient.condition, newPatient.equipment);
+      let finalPriority = Priority.MEDIUM;
+      try {
+        const assessment = await assessPatientPriority(newPatient.condition, newPatient.equipment);
+        if (assessment && assessment.priority) {
+          finalPriority = assessment.priority as Priority;
+        }
+      } catch (aiErr) {
+        console.warn("AI assessment failed during patient registration, using rule-based fallback:", aiErr);
+        // Robust rule-based fallback
+        const eqStr = (newPatient.equipment || []).join(' ').toLowerCase();
+        const condStr = newPatient.condition.toLowerCase();
+        if (eqStr.includes('ช่วยหายใจ') || condStr.includes('เครื่องช่วยหายใจ')) {
+          finalPriority = Priority.CRITICAL;
+        } else if (eqStr.includes('ออกซิเจน') || eqStr.includes('เสมหะ')) {
+          finalPriority = Priority.HIGH;
+        }
+      }
+
       const patient: Patient = {
         id: Math.random().toString(36).substring(2, 11),
         name: newPatient.name,
@@ -250,7 +267,7 @@ const App: React.FC = () => {
         address: newPatient.address,
         contact: newPatient.contact,
         coordinates: { lat: newPatient.lat, lng: newPatient.lng },
-        priority: assessment.priority as Priority,
+        priority: finalPriority,
         status: PowerStatus.NORMAL,
         lastUpdated: new Date().toISOString()
       };
@@ -259,7 +276,7 @@ const App: React.FC = () => {
       setIsFormOpen(false);
       setNewPatient({ name: '', age: '', condition: '', equipment: [], address: '', contact: '', lat: 12.6814, lng: 101.2813 });
     } catch (err) {
-      console.error(err);
+      console.error("Critical error in registering new patient:", err);
     } finally {
       setIsAssessing(false);
     }
@@ -271,17 +288,34 @@ const App: React.FC = () => {
     setIsAssessing(true);
 
     try {
-      const assessment = await assessPatientPriority(editingPatient.condition, editingPatient.equipment);
+      // 1. Attempt to run AI assessment matching edited fields
+      let finalPriority = editingPatient.priority;
+      try {
+        const assessment = await assessPatientPriority(editingPatient.condition, editingPatient.equipment);
+        if (assessment && assessment.priority) {
+          finalPriority = assessment.priority as Priority;
+        }
+      } catch (aiErr) {
+        console.warn("AI priority assessment failed, using manually-selected/existing priority instead:", aiErr);
+      }
+
       const updated: Patient = {
         ...editingPatient,
-        priority: assessment.priority as Priority,
+        priority: finalPriority,
         lastUpdated: new Date().toISOString()
       };
 
       sendAction('UPDATE_PATIENT', updated);
       setEditingPatient(null);
     } catch (err) {
-      console.error(err);
+      console.error("Critical error in saving edited patient data:", err);
+      // Fallback: guaranteed instant save to avoid freezing the Admin modal
+      const fallbackUpdated: Patient = {
+        ...editingPatient,
+        lastUpdated: new Date().toISOString()
+      };
+      sendAction('UPDATE_PATIENT', fallbackUpdated);
+      setEditingPatient(null);
     } finally {
       setIsAssessing(false);
     }
@@ -1032,6 +1066,27 @@ const App: React.FC = () => {
                           className={`px-4 py-2.5 rounded-2xl border text-left text-xs font-bold transition-all
                             ${editingPatient.equipment.includes(item) ? 'bg-blue-600 border-blue-600 text-white shadow-lg' : 'bg-white border-slate-200 text-slate-600 hover:border-slate-300 hover:bg-slate-50'}`}>
                           {item}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="space-y-3">
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest block">ระดับวิกฤตความสำคัญ (แอดมินกำหนดเอง หรืออัปเดตตามคำแนะนำ AI)</label>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      {Object.values(Priority).map(p => (
+                        <button key={p} type="button" onClick={() => setEditingPatient({...editingPatient, priority: p})}
+                          className={`px-3 py-2.5 rounded-2xl border text-center text-[11px] font-black transition-all
+                            ${editingPatient.priority === p 
+                              ? p === Priority.CRITICAL ? 'bg-rose-600 border-rose-600 text-white shadow-lg shadow-rose-600/20'
+                                : p === Priority.HIGH ? 'bg-orange-500 border-orange-500 text-white shadow-lg shadow-orange-500/20'
+                                : p === Priority.MEDIUM ? 'bg-blue-600 border-blue-600 text-white shadow-lg shadow-blue-600/20'
+                                : 'bg-slate-700 border-slate-700 text-white shadow-lg shadow-slate-700/20'
+                              : 'bg-white border-slate-200 text-slate-600 hover:border-slate-300 hover:bg-slate-50'}`}>
+                          {p === Priority.CRITICAL ? '🚨 วิกฤตสูงสุด' 
+                           : p === Priority.HIGH ? '🟠 สูง' 
+                           : p === Priority.MEDIUM ? '🔵 ปานกลาง' 
+                           : '🟢 ต่ำ'}
                         </button>
                       ))}
                     </div>
