@@ -103,21 +103,80 @@ const App: React.FC = () => {
     lng: 101.2813
   });
 
+  // Synchronise state from server with client's localStorage backup (peer persistence)
+  const syncStateAndBackup = useCallback(async (serverData: any) => {
+    if (!serverData) return;
+
+    // Get parent backing if any
+    const localBackupStr = localStorage.getItem('pea_lifeline_backup_v2');
+    if (localBackupStr) {
+      try {
+        const localBackup = JSON.parse(localBackupStr);
+        const serverTime = new Date(serverData.lastUpdated || 0).getTime();
+        const clientTime = new Date(localBackup.lastUpdated || 0).getTime();
+
+        // If client has a newer state AND contains patients, trigger REST API restore to server
+        if (clientTime > serverTime && localBackup.patients && localBackup.patients.length > 0) {
+          console.log(`[RESTORE] This device has a newer database state. Server: ${serverData.lastUpdated}, Client: ${localBackup.lastUpdated}. Restoring server state...`);
+          setPatients(localBackup.patients);
+          setPlannedZone(localBackup.plannedZone);
+          setIsSimulationEnabled(localBackup.isSimulationEnabled);
+
+          try {
+            const res = await fetch("/api/restore", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                patients: localBackup.patients,
+                plannedZone: localBackup.plannedZone,
+                isSimulationEnabled: localBackup.isSimulationEnabled,
+                lastUpdated: localBackup.lastUpdated
+              })
+            });
+            if (res.ok) {
+              console.log("[RESTORE] Server database successfully restored and in-sync with your device!");
+              return;
+            }
+          } catch (restoreErr) {
+            console.error("Failed to post restore database payload:", restoreErr);
+          }
+        }
+      } catch (parseErr) {
+        console.warn("Failed parsing state backup from localStorage:", parseErr);
+      }
+    }
+
+    // Default route: apply server data
+    if (serverData.patients) setPatients(serverData.patients);
+    if (serverData.plannedZone) setPlannedZone(serverData.plannedZone);
+    if (serverData.isSimulationEnabled !== undefined) setIsSimulationEnabled(serverData.isSimulationEnabled);
+
+    // Write server's state back to our localStorage backup to maintain synchrony
+    try {
+      localStorage.setItem('pea_lifeline_backup_v2', JSON.stringify({
+        patients: serverData.patients,
+        plannedZone: serverData.plannedZone,
+        isSimulationEnabled: serverData.isSimulationEnabled,
+        lastUpdated: serverData.lastUpdated || new Date().toISOString()
+      }));
+    } catch (saveErr) {
+      console.warn("Could not save synchronized state to browser database:", saveErr);
+    }
+  }, []);
+
   // Load State from server via REST API on Mount (Immediate & Robust Fallback)
   const fetchStateHTTP = useCallback(async () => {
     try {
       const res = await fetch("/api/state");
       if (res.ok) {
         const data = await res.json();
-        if (data.patients) setPatients(data.patients);
-        if (data.plannedZone) setPlannedZone(data.plannedZone);
-        if (data.isSimulationEnabled !== undefined) setIsSimulationEnabled(data.isSimulationEnabled);
+        await syncStateAndBackup(data);
         console.log("System state successfully synced via HTTP REST.");
       }
     } catch (err) {
       console.warn("Failed to retrieve system state via REST API, will retry:", err);
     }
-  }, []);
+  }, [syncStateAndBackup]);
 
   // Sync state on load
   useEffect(() => {
@@ -141,16 +200,13 @@ const App: React.FC = () => {
       socket.onopen = () => {
         setWsStatus('connected');
         console.log('Real-time connection established successfully.');
-        if (pollingInterval) clearInterval(pollingInterval);
       };
 
       socket.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
           if (msg.type === 'STATE_SYNC') {
-            setPatients(msg.data.patients);
-            setPlannedZone(msg.data.plannedZone);
-            setIsSimulationEnabled(msg.data.isSimulationEnabled);
+            syncStateAndBackup(msg.data);
           }
         } catch (e) {
           console.error('Failed parsing sync payload:', e);
@@ -160,11 +216,6 @@ const App: React.FC = () => {
       socket.onclose = () => {
         setWsStatus('disconnected');
         reconnectTimeout = setTimeout(connect, 3000); // retry connect in 3 seconds
-        
-        // Start polling fallback when disconnected
-        if (!pollingInterval) {
-          pollingInterval = setInterval(fetchStateHTTP, 5000);
-        }
       };
 
       socket.onerror = (err) => {
@@ -175,12 +226,15 @@ const App: React.FC = () => {
 
     connect();
 
+    // Hybrid active polling to keep ALL terminals in sync regardless of Websocket restrictions
+    pollingInterval = setInterval(fetchStateHTTP, 3500);
+
     return () => {
       if (socket) socket.close();
       clearTimeout(reconnectTimeout);
       if (pollingInterval) clearInterval(pollingInterval);
     };
-  }, [fetchStateHTTP]);
+  }, [fetchStateHTTP, syncStateAndBackup]);
 
   // Monitor patients for newly occurred outages to trigger visual alerts and programmatic sound
   useEffect(() => {
@@ -221,17 +275,40 @@ const App: React.FC = () => {
 
   // Send action instructions to server to broadcast and sync
   const sendAction = async (action: string, data: any) => {
-    // Optimistic state updates to make the UI ultra-fluid and instant and prevent UI freezes
+    const nowTimestamp = new Date().toISOString();
+
+    // 1. Optimistic state updates to make the UI ultra-fluid and instant and prevent UI freezes
+    let updatedPatients = [...patients];
+    let updatedPlannedZone = { ...plannedZone };
+    let updatedSim = isSimulationEnabled;
+
     if (action === 'ADD_PATIENT') {
-      setPatients(prev => [data, ...prev]);
+      updatedPatients = [data, ...patients];
+      setPatients(updatedPatients);
     } else if (action === 'UPDATE_PATIENT') {
-      setPatients(prev => prev.map(p => p.id === data.id ? { ...p, ...data } : p));
+      updatedPatients = patients.map(p => p.id === data.id ? { ...p, ...data, lastUpdated: nowTimestamp } : p);
+      setPatients(updatedPatients);
     } else if (action === 'DELETE_PATIENT') {
-      setPatients(prev => prev.filter(p => p.id !== data.id));
+      updatedPatients = patients.filter(p => p.id !== data.id);
+      setPatients(updatedPatients);
     } else if (action === 'UPDATE_PLANNED_ZONE') {
-      setPlannedZone(prev => ({ ...prev, ...data }));
+      updatedPlannedZone = { ...plannedZone, ...data };
+      setPlannedZone(updatedPlannedZone);
     } else if (action === 'UPDATE_SIMULATION') {
-      setIsSimulationEnabled(!!data.isSimulationEnabled);
+      updatedSim = !!data.isSimulationEnabled;
+      setIsSimulationEnabled(updatedSim);
+    }
+
+    // 2. Write backup directly to local storage so it is immediately persisted on client device
+    try {
+      localStorage.setItem('pea_lifeline_backup_v2', JSON.stringify({
+        patients: updatedPatients,
+        plannedZone: updatedPlannedZone,
+        isSimulationEnabled: updatedSim,
+        lastUpdated: nowTimestamp
+      }));
+    } catch (saveErr) {
+      console.warn("Optimistic local storage save failed:", saveErr);
     }
 
     try {

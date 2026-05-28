@@ -44,6 +44,7 @@ let plannedZone = {
 };
 
 let isSimulationEnabled = true;
+let lastUpdated = new Date().toISOString();
 
 const DB_FILE = path.join(process.cwd(), "db.json");
 
@@ -55,7 +56,12 @@ function loadDB() {
       if (parsed.patients) patients = parsed.patients;
       if (parsed.plannedZone) plannedZone = parsed.plannedZone;
       if (parsed.isSimulationEnabled !== undefined) isSimulationEnabled = parsed.isSimulationEnabled;
-      console.log(`[DB] Loaded successfully with ${patients.length} patients.`);
+      if (parsed.lastUpdated) {
+        lastUpdated = parsed.lastUpdated;
+      } else {
+        lastUpdated = new Date().toISOString();
+      }
+      console.log(`[DB] Loaded successfully with ${patients.length} patients. Last updated: ${lastUpdated}`);
     } else {
       // Setup mock / default patients if database is empty so the app has data initially
       patients = [
@@ -99,6 +105,7 @@ function loadDB() {
           lastUpdated: new Date().toISOString()
         }
       ];
+      lastUpdated = new Date().toISOString();
       saveDB();
       console.log("[DB] Created initial fallback DB configuration.");
     }
@@ -109,7 +116,7 @@ function loadDB() {
 
 function saveDB() {
   try {
-    fs.writeFileSync(DB_FILE, JSON.stringify({ patients, plannedZone, isSimulationEnabled }, null, 2), "utf-8");
+    fs.writeFileSync(DB_FILE, JSON.stringify({ patients, plannedZone, isSimulationEnabled, lastUpdated }, null, 2), "utf-8");
   } catch (err) {
     console.error("[DB] Failed to save database:", err);
   }
@@ -146,7 +153,8 @@ function broadcastFullState() {
   broadcast("STATE_SYNC", {
     patients,
     plannedZone,
-    isSimulationEnabled
+    isSimulationEnabled,
+    lastUpdated
   });
 }
 
@@ -157,7 +165,8 @@ wss.on("connection", (ws) => {
     data: {
       patients,
       plannedZone,
-      isSimulationEnabled
+      isSimulationEnabled,
+      lastUpdated
     }
   }));
 
@@ -166,6 +175,7 @@ wss.on("connection", (ws) => {
       const { type, action, data } = JSON.parse(message.toString());
 
       if (type === "ACTION") {
+        lastUpdated = new Date().toISOString();
         switch (action) {
           case "ADD_PATIENT":
             patients = [data, ...patients];
@@ -224,6 +234,7 @@ setInterval(() => {
     lastUpdated: new Date().toISOString()
   } : p);
 
+  lastUpdated = new Date().toISOString();
   saveDB();
   broadcastFullState();
 }, 15000);
@@ -233,7 +244,8 @@ app.get("/api/state", (req, res) => {
   res.json({
     patients,
     plannedZone,
-    isSimulationEnabled
+    isSimulationEnabled,
+    lastUpdated
   });
 });
 
@@ -245,6 +257,7 @@ app.post("/api/actions", (req, res) => {
   }
 
   try {
+    lastUpdated = new Date().toISOString();
     switch (action) {
       case "ADD_PATIENT":
         patients = [data, ...patients];
@@ -271,6 +284,32 @@ app.post("/api/actions", (req, res) => {
   } catch (err: any) {
     console.error("Failed to execute REST API action:", err);
     return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// REST API to restore whole database from client backup (robust peer persistence)
+app.post("/api/restore", (req, res) => {
+  const { patients: clientPatients, plannedZone: clientPlannedZone, isSimulationEnabled: clientSim, lastUpdated: clientLastUpdated } = req.body;
+  
+  if (!clientPatients || !clientLastUpdated) {
+    return res.status(400).json({ error: "Invalid backup data" });
+  }
+
+  const clientTime = new Date(clientLastUpdated).getTime();
+  const serverTime = new Date(lastUpdated).getTime();
+
+  // Accept restore if client timestamp is actually newer
+  if (clientTime > serverTime) {
+    console.log(`[RESTORE] Restoring database due to newer client timestamp. Server: ${lastUpdated}, Client: ${clientLastUpdated}`);
+    patients = clientPatients;
+    if (clientPlannedZone) plannedZone = clientPlannedZone;
+    if (clientSim !== undefined) isSimulationEnabled = !!clientSim;
+    lastUpdated = clientLastUpdated;
+    saveDB();
+    broadcastFullState();
+    return res.json({ success: true, message: "Database state restored successfully." });
+  } else {
+    return res.json({ success: false, message: "Server database is already up-to-date.", serverLastUpdated: lastUpdated });
   }
 });
 
