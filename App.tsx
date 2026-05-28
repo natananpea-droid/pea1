@@ -195,7 +195,17 @@ const App: React.FC = () => {
     try {
       setIsSyncingSheet(true);
       setSheetSyncMessage("📤 กำลังส่งออกข้อมูลพิกัดขึ้น Google Sheets...");
-      await writePatientsToSheet(spreadsheetId, googleToken, patients);
+      
+      if (googleToken === 'SERVER_MANAGED') {
+        const res = await fetch("/api/sheets/force-sync", { method: "POST" });
+        if (!res.ok) {
+          const errData = await res.json();
+          throw new Error(errData.error || "Force sync failed");
+        }
+      } else {
+        await writePatientsToSheet(spreadsheetId, googleToken, patients);
+      }
+      
       setSheetSyncMessage("✅ อัปโหลดและเขียนข้อมูลลง Google Sheets เรียบร้อย!");
     } catch (err: any) {
       console.error("[Google Sheets] Export failed:", err);
@@ -211,28 +221,44 @@ const App: React.FC = () => {
     try {
       setIsSyncingSheet(true);
       setSheetSyncMessage("📥 กำลังดึงข้อมูลจาก Google Sheets...");
-      const sheetPatients = await readPatientsFromSheet(spreadsheetId, googleToken);
-      if (sheetPatients && sheetPatients.length > 0) {
-        // Push the entire registry list to our backend server
-        const res = await fetch("/api/restore", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            patients: sheetPatients,
-            plannedZone: plannedZone,
-            isSimulationEnabled: isSimulationEnabled,
-            lastUpdated: new Date().toISOString()
-          })
-        });
-        
-        if (res.ok) {
-          setPatients(sheetPatients);
+      
+      if (googleToken === 'SERVER_MANAGED') {
+        const res = await fetch("/api/sheets/import", { method: "POST" });
+        if (!res.ok) {
+          const errData = await res.json();
+          throw new Error(errData.error || "Server-side import failed");
+        }
+        const data = await res.json();
+        if (data.patients && data.patients.length > 0) {
+          setPatients(data.patients);
           setSheetSyncMessage("🚀 ดึงฐานข้อมูลผู้ป่วยจากแผ่นงานเข้ามาเรียบร้อย!");
         } else {
-          setSheetSyncMessage("❌ ข้อผิดพลาดในการจัดเก็บเข้าคลาวด์เมนเฟรม");
+          setSheetSyncMessage("⚠️ ไม่พบข้อมูลผู้ป่วยใดๆ ในกระดาษแผ่นคำนวณที่ระบุ");
         }
       } else {
-        setSheetSyncMessage("⚠️ ไม่พบข้อมูลผู้ป่วยใดๆ ในกระดาษแผ่นคำนวณที่ระบุ");
+        const sheetPatients = await readPatientsFromSheet(spreadsheetId, googleToken);
+        if (sheetPatients && sheetPatients.length > 0) {
+          // Push the entire registry list to our backend server
+          const res = await fetch("/api/restore", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              patients: sheetPatients,
+              plannedZone: plannedZone,
+              isSimulationEnabled: isSimulationEnabled,
+              lastUpdated: new Date().toISOString()
+            })
+          });
+          
+          if (res.ok) {
+            setPatients(sheetPatients);
+            setSheetSyncMessage("🚀 ดึงฐานข้อมูลผู้ป่วยจากแผ่นงานเข้ามาเรียบร้อย!");
+          } else {
+            setSheetSyncMessage("❌ ข้อผิดพลาดในการจัดเก็บเข้าคลาวด์เมนเฟรม");
+          }
+        } else {
+          setSheetSyncMessage("⚠️ ไม่พบข้อมูลผู้ป่วยใดๆ ในกระดาษแผ่นคำนวณที่ระบุ");
+        }
       }
     } catch (err: any) {
       console.error("[Google Sheets] Import failed:", err);
@@ -250,6 +276,18 @@ const App: React.FC = () => {
       if (result) {
         setGoogleUser(result.user);
         setGoogleToken(result.accessToken);
+        
+        // Synchronise the access token with the server-side proxy
+        await fetch("/api/sheets/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            accessToken: result.accessToken,
+            email: result.user.email,
+            spreadsheetId: spreadsheetId
+          })
+        }).catch(err => console.error("Error setting server-side sheets credentials:", err));
+
         await syncWithGoogleSheet(result.accessToken, patients);
       }
     } catch (err: any) {
@@ -264,6 +302,11 @@ const App: React.FC = () => {
     await logout();
     setGoogleUser(null);
     setGoogleToken(null);
+    
+    // Clear credentials on the server proxy too
+    await fetch("/api/sheets/disconnect", { method: "POST" })
+      .catch(err => console.error("Error clearing server-side sheets credentials:", err));
+    
     setSheetSyncMessage("👋 ตัดการเชื่อมต่อ Google Sheets แล้ว");
     setTimeout(() => setSheetSyncMessage(''), 3000);
   };
@@ -271,22 +314,49 @@ const App: React.FC = () => {
   // Restores Google Auth Session state on load
   useEffect(() => {
     const unsubscribe = initAuth(
-      (user, token) => {
+      async (user, token) => {
         setGoogleUser(user);
         setGoogleToken(token);
-        console.log("Google Sheets session restored:", user.email);
+        console.log("Google Sheets session restored client-side:", user.email);
+
+        // Update server with the restored token
+        await fetch("/api/sheets/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            accessToken: token,
+            email: user.email,
+            spreadsheetId: spreadsheetId
+          })
+        }).catch(err => console.error("Error syncing restored sessions onto server:", err));
       },
-      () => {
+      async () => {
+        // If client-side token is empty, check if backend server still holds a stable OAuth registration
+        try {
+          const res = await fetch("/api/sheets/status");
+          if (res.ok) {
+            const data = await res.json();
+            if (data.connected && data.email) {
+              setGoogleUser({ email: data.email } as any);
+              setGoogleToken('SERVER_MANAGED');
+              console.log("Google Sheets session retrieved from server proxy cache:", data.email);
+              return;
+            }
+          }
+        } catch (serverAuthErr) {
+          console.error("Error querying Sheets sync status from proxy:", serverAuthErr);
+        }
+        
         setGoogleUser(null);
         setGoogleToken(null);
       }
     );
     return () => unsubscribe();
-  }, []);
+  }, [spreadsheetId]);
 
-  // Automatically sync to Google Sheets silently whenever patients state is updated
+  // Automatically sync to Google Sheets silently whenever patients state is updated (only when client-managed)
   useEffect(() => {
-    if (googleToken && patients && patients.length > 0 && !isSyncingSheet) {
+    if (googleToken && googleToken !== 'SERVER_MANAGED' && patients && patients.length > 0 && !isSyncingSheet) {
       const delaySync = setTimeout(() => {
         writePatientsToSheet(spreadsheetId, googleToken, patients)
           .then(() => {

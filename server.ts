@@ -54,11 +54,24 @@ let plannedZone = {
 let isSimulationEnabled = true;
 let lastUpdated = new Date().toISOString();
 
+// Server-Side Google Sheets Integration variables
+let googleAccessToken: string | null = null;
+let googleUserEmail: string | null = null;
+let savedSpreadsheetId: string = "11W01ZXTNRR3uZUHgsfpt7NwbPTiOAdOOZUvtKKOyLbM";
+
 const DB_FILE = path.join(process.cwd(), "db.json");
 
 function saveDBLocalFallback() {
   try {
-    fs.writeFileSync(DB_FILE, JSON.stringify({ patients, plannedZone, isSimulationEnabled, lastUpdated }, null, 2), "utf-8");
+    fs.writeFileSync(DB_FILE, JSON.stringify({ 
+      patients, 
+      plannedZone, 
+      isSimulationEnabled, 
+      lastUpdated,
+      googleAccessToken,
+      googleUserEmail,
+      savedSpreadsheetId
+    }, null, 2), "utf-8");
   } catch (err) {
     // Silently skip local fallback write glitches
   }
@@ -68,7 +81,7 @@ async function loadDBFromFirestore() {
   try {
     console.log("[Firestore] Booting up, pulling latest data from cloud...");
 
-    // 1. Load settings (plannedZone, isSimulationEnabled)
+    // 1. Load settings (plannedZone, isSimulationEnabled, Google Sheets)
     const settingsDocRef = doc(db, "settings", "globalState");
     const settingsSnap = await getDoc(settingsDocRef);
     if (settingsSnap.exists()) {
@@ -76,13 +89,19 @@ async function loadDBFromFirestore() {
       if (data.plannedZone) plannedZone = data.plannedZone;
       if (data.isSimulationEnabled !== undefined) isSimulationEnabled = data.isSimulationEnabled;
       if (data.lastUpdated) lastUpdated = data.lastUpdated;
-      console.log("[Firestore] Global settings loaded successfully:", { isSimulationEnabled, lastUpdated });
+      if (data.googleAccessToken) googleAccessToken = data.googleAccessToken;
+      if (data.googleUserEmail) googleUserEmail = data.googleUserEmail;
+      if (data.savedSpreadsheetId) savedSpreadsheetId = data.savedSpreadsheetId;
+      console.log("[Firestore] Global settings loaded successfully:", { isSimulationEnabled, lastUpdated, googleUserEmail, savedSpreadsheetId });
     } else {
       // Setup initial settings document
       await setDoc(settingsDocRef, {
         plannedZone,
         isSimulationEnabled,
-        lastUpdated: new Date().toISOString()
+        lastUpdated: new Date().toISOString(),
+        googleAccessToken: null,
+        googleUserEmail: null,
+        savedSpreadsheetId
       });
       console.log("[Firestore] Created initial global settings document.");
     }
@@ -178,7 +197,10 @@ async function saveSettingsToFirestore() {
     await setDoc(doc(db, "settings", "globalState"), {
       plannedZone,
       isSimulationEnabled,
-      lastUpdated
+      lastUpdated,
+      googleAccessToken,
+      googleUserEmail,
+      savedSpreadsheetId
     });
     console.log("[Firestore] Global settings saved to cloud.");
   } catch (err) {
@@ -245,6 +267,7 @@ wss.on("connection", (ws) => {
               saveDBLocalFallback();
               await savePatientToFirestore(data);
               await saveSettingsToFirestore();
+              syncToGoogleSheetsServerSide().catch(err => console.error("[WS ADD] Sheets sync failed:", err));
               break;
             case "UPDATE_PATIENT": {
               const updated = { ...data, lastUpdated: new Date().toISOString() };
@@ -253,6 +276,7 @@ wss.on("connection", (ws) => {
               saveDBLocalFallback();
               await savePatientToFirestore(updated);
               await saveSettingsToFirestore();
+              syncToGoogleSheetsServerSide().catch(err => console.error("[WS UPDATE] Sheets sync failed:", err));
               break;
             }
             case "DELETE_PATIENT":
@@ -261,6 +285,7 @@ wss.on("connection", (ws) => {
               saveDBLocalFallback();
               await deletePatientFromFirestore(data.id);
               await saveSettingsToFirestore();
+              syncToGoogleSheetsServerSide().catch(err => console.error("[WS DELETE] Sheets sync failed:", err));
               break;
             case "UPDATE_PLANNED_ZONE":
               plannedZone = { ...plannedZone, ...data };
@@ -320,9 +345,254 @@ setInterval(async () => {
   saveDBLocalFallback();
   if (updatedTarget) {
     await savePatientToFirestore(updatedTarget);
+    syncToGoogleSheetsServerSide().catch(err => console.error("[Sim Outage] Sheets sync failed:", err));
   }
   await saveSettingsToFirestore();
 }, 15000);
+
+// Server-Side Google Sheets Proxy Sync function
+async function syncToGoogleSheetsServerSide() {
+  if (!googleAccessToken || !savedSpreadsheetId) {
+    console.log("[Server Google Sheets] Sync skipped: No token or spreadsheet ID configured on server.");
+    return;
+  }
+
+  try {
+    const spreadsheetId = savedSpreadsheetId;
+    const accessToken = googleAccessToken;
+
+    // 1. Get first sheet name
+    const metaUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=sheets.properties`;
+    const metaRes = await fetch(metaUrl, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    if (!metaRes.ok) {
+      if (metaRes.status === 401) {
+        console.warn("[Server Google Sheets] Unauthorized (401), resetting credentials.");
+        googleAccessToken = null;
+        googleUserEmail = null;
+        return;
+      }
+      const errText = await metaRes.text();
+      throw new Error(`Failed to fetch spreadsheet metadata: ${metaRes.status} ${metaRes.statusText} - ${errText}`);
+    }
+
+    const metaData: any = await metaRes.json();
+    const sheetName = (metaData.sheets && metaData.sheets.length > 0)
+      ? metaData.sheets[0].properties.title
+      : 'Sheet1';
+
+    // 2. Clear first A1:M1000
+    const clearRange = `${sheetName}!A1:M1000`;
+    const clearUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(clearRange)}:clear`;
+    await fetch(clearUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+    });
+
+    // 3. Headers and row values
+    const headers = [
+      'ID', 
+      'ชื่อ-นามสกุล', 
+      'อายุ', 
+      'ระดับวิกฤตความปลอดภัย', 
+      'สถานะกระแสไฟ', 
+      'โรคประจำตัว/ข้อจำกัดพยาบาล', 
+      'อุปกรณ์ช่วยเลี่ยงความเสี่ยง', 
+      'ที่อยู่', 
+      'เบอร์ติดต่อประสานงาน', 
+      'ละติจูด', 
+      'ลองจิจูด', 
+      'ปรับปรุงล่าสุด'
+    ];
+
+    const rows = patients.map(p => [
+      p.id || '',
+      p.name || '',
+      p.age !== undefined ? p.age.toString() : '',
+      p.priority || 'LOW',
+      p.status || 'NORMAL',
+      p.condition || '',
+      p.equipment ? p.equipment.join('|') : '',
+      p.address || '',
+      p.contact || '',
+      p.coordinates?.lat !== undefined ? p.coordinates.lat.toString() : '',
+      p.coordinates?.lng !== undefined ? p.coordinates.lng.toString() : '',
+      p.lastUpdated || new Date().toISOString()
+    ]);
+
+    const values = [headers, ...rows];
+
+    // 4. PUT updated patients data
+    const putRange = `${sheetName}!A1`;
+    const putUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(putRange)}?valueInputOption=USER_ENTERED`;
+    const putRes = await fetch(putUrl, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ values })
+    });
+
+    if (!putRes.ok) {
+      const putErr = await putRes.text();
+      throw new Error(`Failed to write to Google Sheets: ${putRes.status} ${putRes.statusText} - ${putErr}`);
+    }
+
+    console.log(`[Server Google Sheets] Successfully synced ${patients.length} patients to sheet '${sheetName}' in spreadsheet: ${spreadsheetId}`);
+  } catch (err: any) {
+    console.error("[Server Google Sheets] Sync failed:", err);
+  }
+}
+
+// Google Sheets endpoints
+app.post("/api/sheets/config", async (req, res) => {
+  const { accessToken, email, spreadsheetId } = req.body;
+  if (accessToken) googleAccessToken = accessToken;
+  if (email) googleUserEmail = email;
+  if (spreadsheetId) {
+    const trimmed = spreadsheetId.trim();
+    const match = trimmed.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    savedSpreadsheetId = (match && match[1]) ? match[1] : trimmed;
+  }
+
+  await saveSettingsToFirestore();
+  saveDBLocalFallback();
+
+  console.log(`[Google Sheets API Config] Connected by ${googleUserEmail} on sheet ID ${savedSpreadsheetId}`);
+  
+  // Trigger immediate write sync
+  syncToGoogleSheetsServerSide().catch(err => console.error("Initial sheets sync failed:", err));
+
+  res.json({ 
+    success: true, 
+    email: googleUserEmail, 
+    spreadsheetId: savedSpreadsheetId 
+  });
+});
+
+app.get("/api/sheets/status", (req, res) => {
+  res.json({
+    connected: !!googleAccessToken,
+    email: googleUserEmail,
+    spreadsheetId: savedSpreadsheetId,
+    patientsCount: patients.length
+  });
+});
+
+app.post("/api/sheets/disconnect", async (req, res) => {
+  googleAccessToken = null;
+  googleUserEmail = null;
+  await saveSettingsToFirestore();
+  saveDBLocalFallback();
+  res.json({ success: true });
+});
+
+app.post("/api/sheets/force-sync", async (req, res) => {
+  if (!googleAccessToken) {
+    return res.status(401).json({ error: "Google Sheets is not connected" });
+  }
+  try {
+    await syncToGoogleSheetsServerSide();
+    res.json({ success: true, message: "Google Sheets sync completed successfully." });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to force sync" });
+  }
+});
+
+app.post("/api/sheets/import", async (req, res) => {
+  if (!googleAccessToken) {
+    return res.status(401).json({ error: "Google Sheets is not connected" });
+  }
+
+  try {
+    const spreadsheetId = savedSpreadsheetId;
+    const accessToken = googleAccessToken;
+
+    // 1. Get first sheet name
+    const metaUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=sheets.properties`;
+    const metaRes = await fetch(metaUrl, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    if (!metaRes.ok) {
+      throw new Error(`Metadata error: ${metaRes.status}`);
+    }
+
+    const metaData: any = await metaRes.json();
+    const sheetName = (metaData.sheets && metaData.sheets.length > 0)
+      ? metaData.sheets[0].properties.title
+      : 'Sheet1';
+
+    // 2. Read values
+    const queryRange = `${sheetName}!A1:M1000`;
+    const getUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(queryRange)}`;
+    const getRes = await fetch(getUrl, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    if (!getRes.ok) {
+      throw new Error(`Data fetch error: ${getRes.status}`);
+    }
+
+    const data: any = await getRes.json();
+    const rows = data.values;
+    if (!rows || rows.length < 2) {
+      return res.json({ success: true, patients: [] });
+    }
+
+    const headers = rows[0];
+    const patientRows = rows.slice(1);
+
+    const importedPatients = patientRows.map((row: any) => {
+      // Find coordinates
+      let lat = 12.6814;
+      let lng = 101.2813;
+      if (row[9] && row[10]) {
+        lat = parseFloat(row[9]) || 12.6814;
+        lng = parseFloat(row[10]) || 101.2813;
+      }
+
+      // Convert equipment string back to array
+      const equipment = row[6] ? row[6].split('|').filter(Boolean) : [];
+
+      return {
+        id: row[0] || Math.random().toString(36).substring(2, 11),
+        name: row[1] || '',
+        age: parseInt(row[2]) || 0,
+        priority: row[3] || 'LOW',
+        status: row[4] || 'NORMAL',
+        condition: row[5] || '',
+        equipment: equipment,
+        address: row[7] || '',
+        contact: row[8] || '',
+        coordinates: { lat, lng },
+        lastUpdated: row[11] || new Date().toISOString()
+      };
+    });
+
+    // Replace system state
+    patients = importedPatients;
+    
+    // Save to Firestore & local
+    for (const p of patients) {
+      await setDoc(doc(db, "patients", p.id), p);
+    }
+    await saveSettingsToFirestore();
+    saveDBLocalFallback();
+    broadcastFullState();
+
+    res.json({ success: true, patients: importedPatients });
+  } catch (err: any) {
+    console.error("[Server Google Sheets Import] failed:", err);
+    res.status(500).json({ error: err.message || "Failed to import from Google Sheets" });
+  }
+});
 
 // REST API to fetch full system state
 app.get("/api/state", (req, res) => {
@@ -347,16 +617,19 @@ app.post("/api/actions", async (req, res) => {
       case "ADD_PATIENT":
         patients = [data, ...patients];
         await savePatientToFirestore(data);
+        syncToGoogleSheetsServerSide().catch(err => console.error("[REST ADD] Sheets sync failed:", err));
         break;
       case "UPDATE_PATIENT": {
         const updated = { ...data, lastUpdated: new Date().toISOString() };
         patients = patients.map(p => p.id === data.id ? { ...p, ...updated } : p);
         await savePatientToFirestore(updated);
+        syncToGoogleSheetsServerSide().catch(err => console.error("[REST UPDATE] Sheets sync failed:", err));
         break;
       }
       case "DELETE_PATIENT":
         patients = patients.filter(p => p.id !== data.id);
         await deletePatientFromFirestore(data.id);
+        syncToGoogleSheetsServerSide().catch(err => console.error("[REST DELETE] Sheets sync failed:", err));
         break;
       case "UPDATE_PLANNED_ZONE":
         plannedZone = { ...plannedZone, ...data };
@@ -491,7 +764,7 @@ async function configureServer() {
     // Production mode
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
+    app.get("*all", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
