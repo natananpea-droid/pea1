@@ -1,6 +1,7 @@
 import express from "express";
 import path from "path";
 import http from "http";
+import fs from "fs";
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
@@ -33,7 +34,7 @@ function getAI() {
   return aiInstance;
 }
 
-// Real-Time Shared Database State (In-Memory on the Server)
+// Real-Time Shared Database State (In-Memory on the Server & Persisted in db.json)
 let patients: any[] = [];
 
 let plannedZone = {
@@ -43,6 +44,79 @@ let plannedZone = {
 };
 
 let isSimulationEnabled = true;
+
+const DB_FILE = path.join(process.cwd(), "db.json");
+
+function loadDB() {
+  try {
+    if (fs.existsSync(DB_FILE)) {
+      const content = fs.readFileSync(DB_FILE, "utf-8");
+      const parsed = JSON.parse(content);
+      if (parsed.patients) patients = parsed.patients;
+      if (parsed.plannedZone) plannedZone = parsed.plannedZone;
+      if (parsed.isSimulationEnabled !== undefined) isSimulationEnabled = parsed.isSimulationEnabled;
+      console.log(`[DB] Loaded successfully with ${patients.length} patients.`);
+    } else {
+      // Setup mock / default patients if database is empty so the app has data initially
+      patients = [
+        {
+          id: "pat_1",
+          name: "นางมณี รัตนมงคล",
+          age: 78,
+          condition: "ผู้ป่วยติดเตียง เป็นอัมพาตท่อนล่างตั้งแต่สะโพกลงไป มีแผลกดทับที่ต้องดูแลความสะอาดและพลิกตัว",
+          equipment: ["เตียงพยาบาลไฟฟ้า", "ที่นอนลมป้องกันแผลกดทับ"],
+          address: "142/9 หมู่ 2 ตำบลเชิงเนิน อำเภอเมือง ระยอง",
+          contact: "081-345-6789 (ลูกสาว)",
+          coordinates: { lat: 12.6845, lng: 101.2842 },
+          priority: "CRITICAL",
+          status: "NORMAL",
+          lastUpdated: new Date().toISOString()
+        },
+        {
+          id: "pat_2",
+          name: "นายวิชัย สมบูรณ์ทรัพย์",
+          age: 84,
+          condition: "โรคปอดอุดกั้นเรื้อรัง (COPD) ระยะก้าวหน้า อ่อนแรงมาก ต้องพ่นยาขยายหลอดลมเป็นช่วงๆ",
+          equipment: ["เครื่องพ่นยาขยายหลอดลม", "เครื่องดูดเสมหะไฟฟ้า"],
+          address: "55/12 ถนนจันทอุดม ตำบลท่าประดู่ อำเภอเมือง ระยอง",
+          contact: "089-765-4321 (คุณสมเกียรติ - หลาน)",
+          coordinates: { lat: 12.6892, lng: 101.2785 },
+          priority: "HIGH",
+          status: "NORMAL",
+          lastUpdated: new Date().toISOString()
+        },
+        {
+          id: "pat_3",
+          name: "ยายทองดี สมนึก",
+          age: 81,
+          condition: "กระดูกสะโพกหักจากการหกล้ม เคลื่อนไหวร่างกายไม่ได้ ช่วยเหลือตัวเองแทบไม่ได้",
+          equipment: ["เครื่องผลิตออกซิเจน 5 ลิตร", "ที่นอนลมป้องกันแผลกดทับ"],
+          address: "88 หมู่ 4 ตำบลเนินพระ อำเภอเมือง ระยอง",
+          contact: "086-111-2222 (ลูกสะใภ้)",
+          coordinates: { lat: 12.6781, lng: 101.2910 },
+          priority: "MEDIUM",
+          status: "NORMAL",
+          lastUpdated: new Date().toISOString()
+        }
+      ];
+      saveDB();
+      console.log("[DB] Created initial fallback DB configuration.");
+    }
+  } catch (err) {
+    console.error("[DB] Failed to load database:", err);
+  }
+}
+
+function saveDB() {
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify({ patients, plannedZone, isSimulationEnabled }, null, 2), "utf-8");
+  } catch (err) {
+    console.error("[DB] Failed to save database:", err);
+  }
+}
+
+// Immediately load database state at boot
+loadDB();
 
 // WebSocket Server setups
 const wss = new WebSocketServer({ noServer: true });
@@ -95,22 +169,27 @@ wss.on("connection", (ws) => {
         switch (action) {
           case "ADD_PATIENT":
             patients = [data, ...patients];
+            saveDB();
             broadcastFullState();
             break;
           case "UPDATE_PATIENT":
             patients = patients.map(p => p.id === data.id ? { ...p, ...data, lastUpdated: new Date().toISOString() } : p);
+            saveDB();
             broadcastFullState();
             break;
           case "DELETE_PATIENT":
             patients = patients.filter(p => p.id !== data.id);
+            saveDB();
             broadcastFullState();
             break;
           case "UPDATE_PLANNED_ZONE":
             plannedZone = { ...plannedZone, ...data };
+            saveDB();
             broadcastFullState();
             break;
           case "UPDATE_SIMULATION":
             isSimulationEnabled = !!data.isSimulationEnabled;
+            saveDB();
             broadcastFullState();
             break;
           default:
@@ -145,8 +224,55 @@ setInterval(() => {
     lastUpdated: new Date().toISOString()
   } : p);
 
+  saveDB();
   broadcastFullState();
 }, 15000);
+
+// REST API to fetch full system state
+app.get("/api/state", (req, res) => {
+  res.json({
+    patients,
+    plannedZone,
+    isSimulationEnabled
+  });
+});
+
+// REST API fallback for action syncing (highly reliable fallback when WebSockets are unstable or blocked)
+app.post("/api/actions", (req, res) => {
+  const { action, data } = req.body;
+  if (!action) {
+    return res.status(400).json({ error: "Action is required" });
+  }
+
+  try {
+    switch (action) {
+      case "ADD_PATIENT":
+        patients = [data, ...patients];
+        break;
+      case "UPDATE_PATIENT":
+        patients = patients.map(p => p.id === data.id ? { ...p, ...data, lastUpdated: new Date().toISOString() } : p);
+        break;
+      case "DELETE_PATIENT":
+        patients = patients.filter(p => p.id !== data.id);
+        break;
+      case "UPDATE_PLANNED_ZONE":
+        plannedZone = { ...plannedZone, ...data };
+        break;
+      case "UPDATE_SIMULATION":
+        isSimulationEnabled = !!data.isSimulationEnabled;
+        break;
+      default:
+        return res.status(400).json({ error: `Unknown action: ${action}` });
+    }
+
+    saveDB();
+    broadcastFullState();
+    return res.json({ success: true, message: `Action ${action} executed and broadcasted successfully.` });
+  } catch (err: any) {
+    console.error("Failed to execute REST API action:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 // API for AI Assessment (Proxied safely from server to keep keys secure)
 app.post("/api/assess", async (req, res) => {

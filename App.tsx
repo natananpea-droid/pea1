@@ -103,10 +103,32 @@ const App: React.FC = () => {
     lng: 101.2813
   });
 
+  // Load State from server via REST API on Mount (Immediate & Robust Fallback)
+  const fetchStateHTTP = useCallback(async () => {
+    try {
+      const res = await fetch("/api/state");
+      if (res.ok) {
+        const data = await res.json();
+        if (data.patients) setPatients(data.patients);
+        if (data.plannedZone) setPlannedZone(data.plannedZone);
+        if (data.isSimulationEnabled !== undefined) setIsSimulationEnabled(data.isSimulationEnabled);
+        console.log("System state successfully synced via HTTP REST.");
+      }
+    } catch (err) {
+      console.warn("Failed to retrieve system state via REST API, will retry:", err);
+    }
+  }, []);
+
+  // Sync state on load
+  useEffect(() => {
+    fetchStateHTTP();
+  }, [fetchStateHTTP]);
+
   // Establish WebSocket connection and handle auto-reconnection
   useEffect(() => {
     let socket: WebSocket;
     let reconnectTimeout: any;
+    let pollingInterval: any;
 
     const connect = () => {
       setWsStatus('connecting');
@@ -119,6 +141,7 @@ const App: React.FC = () => {
       socket.onopen = () => {
         setWsStatus('connected');
         console.log('Real-time connection established successfully.');
+        if (pollingInterval) clearInterval(pollingInterval);
       };
 
       socket.onmessage = (event) => {
@@ -137,6 +160,11 @@ const App: React.FC = () => {
       socket.onclose = () => {
         setWsStatus('disconnected');
         reconnectTimeout = setTimeout(connect, 3000); // retry connect in 3 seconds
+        
+        // Start polling fallback when disconnected
+        if (!pollingInterval) {
+          pollingInterval = setInterval(fetchStateHTTP, 5000);
+        }
       };
 
       socket.onerror = (err) => {
@@ -150,8 +178,9 @@ const App: React.FC = () => {
     return () => {
       if (socket) socket.close();
       clearTimeout(reconnectTimeout);
+      if (pollingInterval) clearInterval(pollingInterval);
     };
-  }, []);
+  }, [fetchStateHTTP]);
 
   // Monitor patients for newly occurred outages to trigger visual alerts and programmatic sound
   useEffect(() => {
@@ -191,15 +220,40 @@ const App: React.FC = () => {
   }, [patients, isAlertMuted, playOutageAlarm]);
 
   // Send action instructions to server to broadcast and sync
-  const sendAction = (action: string, data: any) => {
-    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify({
-        type: 'ACTION',
-        action,
-        data
-      }));
-    } else {
-      console.warn('Unable to send action, WebSocket disconnected.');
+  const sendAction = async (action: string, data: any) => {
+    // Optimistic state updates to make the UI ultra-fluid and instant and prevent UI freezes
+    if (action === 'ADD_PATIENT') {
+      setPatients(prev => [data, ...prev]);
+    } else if (action === 'UPDATE_PATIENT') {
+      setPatients(prev => prev.map(p => p.id === data.id ? { ...p, ...data } : p));
+    } else if (action === 'DELETE_PATIENT') {
+      setPatients(prev => prev.filter(p => p.id !== data.id));
+    } else if (action === 'UPDATE_PLANNED_ZONE') {
+      setPlannedZone(prev => ({ ...prev, ...data }));
+    } else if (action === 'UPDATE_SIMULATION') {
+      setIsSimulationEnabled(!!data.isSimulationEnabled);
+    }
+
+    try {
+      if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+        socketRef.current.send(JSON.stringify({
+          type: 'ACTION',
+          action,
+          data
+        }));
+      } else {
+        console.warn('WebSocket not active, syncing action via highly-reliable REST interface.');
+        const response = await fetch('/api/actions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action, data })
+        });
+        if (!response.ok) {
+          throw new Error(`REST action post returned error: ${response.status}`);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to synchronize and save action payload with server:', err);
     }
   };
 
