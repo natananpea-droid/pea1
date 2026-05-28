@@ -3,6 +3,7 @@ import { Patient, Priority, PowerStatus, PlannedOutageZone } from './types';
 import { EQUIPMENT_OPTIONS } from './constants';
 import PatientMap from './components/PatientMap';
 import PatientCard from './components/PatientCard';
+import PatientsRegistry from './components/PatientsRegistry';
 import { assessPatientPriority } from './services/geminiService';
 import { Bell, Volume2, VolumeX, AlertTriangle, Crosshair } from 'lucide-react';
 
@@ -14,6 +15,7 @@ const App: React.FC = () => {
   const [editingPatient, setEditingPatient] = useState<Patient | null>(null);
   const [isAssessing, setIsAssessing] = useState(false);
   const [isSimulationEnabled, setIsSimulationEnabled] = useState(true);
+  const [activeTab, setActiveTab] = useState<'map' | 'registry'>('map');
 
   // Real-time alarm notification states
   const [isAlertMuted, setIsAlertMuted] = useState(false);
@@ -103,55 +105,23 @@ const App: React.FC = () => {
     lng: 101.2813
   });
 
-  // Synchronise state from server with client's localStorage backup (peer persistence)
+  // Prevent guests or standard users from accessing registry directory
+  useEffect(() => {
+    if (!isAdmin && activeTab === 'registry') {
+      setActiveTab('map');
+    }
+  }, [isAdmin, activeTab]);
+
+  // Synchronise state from server with client's localStorage backup (peer cache fallback)
   const syncStateAndBackup = useCallback(async (serverData: any) => {
     if (!serverData) return;
 
-    // Get parent backing if any
-    const localBackupStr = localStorage.getItem('pea_lifeline_backup_v2');
-    if (localBackupStr) {
-      try {
-        const localBackup = JSON.parse(localBackupStr);
-        const serverTime = new Date(serverData.lastUpdated || 0).getTime();
-        const clientTime = new Date(localBackup.lastUpdated || 0).getTime();
-
-        // If client has a newer state AND contains patients, trigger REST API restore to server
-        if (clientTime > serverTime && localBackup.patients && localBackup.patients.length > 0) {
-          console.log(`[RESTORE] This device has a newer database state. Server: ${serverData.lastUpdated}, Client: ${localBackup.lastUpdated}. Restoring server state...`);
-          setPatients(localBackup.patients);
-          setPlannedZone(localBackup.plannedZone);
-          setIsSimulationEnabled(localBackup.isSimulationEnabled);
-
-          try {
-            const res = await fetch("/api/restore", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                patients: localBackup.patients,
-                plannedZone: localBackup.plannedZone,
-                isSimulationEnabled: localBackup.isSimulationEnabled,
-                lastUpdated: localBackup.lastUpdated
-              })
-            });
-            if (res.ok) {
-              console.log("[RESTORE] Server database successfully restored and in-sync with your device!");
-              return;
-            }
-          } catch (restoreErr) {
-            console.error("Failed to post restore database payload:", restoreErr);
-          }
-        }
-      } catch (parseErr) {
-        console.warn("Failed parsing state backup from localStorage:", parseErr);
-      }
-    }
-
-    // Default route: apply server data
+    // Apply cloud server data as the single source of truth
     if (serverData.patients) setPatients(serverData.patients);
     if (serverData.plannedZone) setPlannedZone(serverData.plannedZone);
     if (serverData.isSimulationEnabled !== undefined) setIsSimulationEnabled(serverData.isSimulationEnabled);
 
-    // Write server's state back to our localStorage backup to maintain synchrony
+    // Save synchronized state to client's localStorage cache for offline/disconnection resilience
     try {
       localStorage.setItem('pea_lifeline_backup_v2', JSON.stringify({
         patients: serverData.patients,
@@ -160,7 +130,7 @@ const App: React.FC = () => {
         lastUpdated: serverData.lastUpdated || new Date().toISOString()
       }));
     } catch (saveErr) {
-      console.warn("Could not save synchronized state to browser database:", saveErr);
+      console.warn("Could not save synchronized state to browser custom cache:", saveErr);
     }
   }, []);
 
@@ -708,8 +678,58 @@ const App: React.FC = () => {
         </div>
       </header>
 
+      {/* Tabs Switcher Navigation Bar */}
+      {isAdmin && (
+        <div className="bg-slate-900 border-t border-b border-slate-800 sticky top-[73px] z-40 shadow-md">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div className="flex space-x-6">
+              <button 
+                onClick={() => setActiveTab('map')}
+                className={`py-3.5 px-2 font-black text-xs sm:text-sm flex items-center gap-2 border-b-2 transition-all cursor-pointer
+                  ${activeTab === 'map' 
+                    ? 'border-blue-500 text-blue-400' 
+                    : 'border-transparent text-slate-400 hover:text-white'}`}
+              >
+                🗺️ แผนที่พิกัดภัยพิบัติและไฟดับ (Live Map)
+              </button>
+              <button 
+                onClick={() => setActiveTab('registry')}
+                className={`py-3.5 px-2 font-black text-xs sm:text-sm flex items-center gap-2 border-b-2 transition-all cursor-pointer
+                  ${activeTab === 'registry' 
+                    ? 'border-blue-500 text-blue-400 animate-pulse' 
+                    : 'border-transparent text-slate-400 hover:text-white'}`}
+              >
+                📋 ทะเบียนรวมรายชื่อผู้ป่วยทั้งหมด (Registry Directory)
+                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${activeTab === 'registry' ? 'bg-blue-500/15 text-blue-400' : 'bg-slate-800 text-slate-500'}`}>
+                  {patients.length} รายชื่อ
+                </span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Main Container */}
-      <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-8 grid grid-cols-1 lg:grid-cols-12 gap-8">
+      <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-8">
+        {activeTab === 'registry' ? (
+          <PatientsRegistry 
+            patients={patients}
+            isAdmin={isAdmin}
+            onLocatePatient={(p) => {
+              setActiveTab('map');
+              setSelectedPatient(p);
+            }}
+            onEditPatient={(p) => {
+              setEditingPatient(p);
+            }}
+            onDeletePatient={(patientId) => {
+              const target = patients.find(p => p.id === patientId);
+              if (target) setPatientToDelete(target);
+            }}
+            onOpenRegisterForm={() => setIsFormOpen(true)}
+          />
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
         
         {/* CASE 1: LOGGED-OUT GUEST (Sees only Register/Verify Phone on Left sidebar) */}
         {!isUserLoggedIn && (
@@ -1010,6 +1030,8 @@ const App: React.FC = () => {
             }}
           />
         </div>
+        </div>
+        )}
       </main>
 
       {/* Admin passcode input MODAL */}
