@@ -11,6 +11,7 @@ interface PatientMapProps {
   plannedZone: PlannedOutageZone;
   onMapClick?: (lat: number, lng: number) => void;
   isPlanningMode: boolean;
+  selectedPatient?: Patient | null;
 }
 
 const PatientMap: React.FC<PatientMapProps> = ({ 
@@ -18,7 +19,8 @@ const PatientMap: React.FC<PatientMapProps> = ({
   onSelectPatient, 
   plannedZone, 
   onMapClick,
-  isPlanningMode
+  isPlanningMode,
+  selectedPatient
 }) => {
   const mapRef = useRef<HTMLDivElement>(null);
   const googleMap = useRef<any>(null);
@@ -146,6 +148,14 @@ const PatientMap: React.FC<PatientMapProps> = ({
       googleMap.current.panTo(plannedZone.center);
     }
   }, [plannedZone.center]);
+
+  // Zoom and center map when a patient is selected
+  useEffect(() => {
+    if (googleMap.current && selectedPatient) {
+      googleMap.current.panTo(selectedPatient.coordinates);
+      googleMap.current.setZoom(16);
+    }
+  }, [selectedPatient]);
 
   return (
     <div className="relative w-full h-[600px] rounded-[32px] overflow-hidden shadow-inner border-2 border-slate-200">
