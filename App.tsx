@@ -5,8 +5,9 @@ import PatientMap from './components/PatientMap';
 import PatientCard from './components/PatientCard';
 import PatientsRegistry from './components/PatientsRegistry';
 import { assessPatientPriority } from './services/geminiService';
-import { Bell, Volume2, VolumeX, AlertTriangle, Crosshair } from 'lucide-react';
+import { Bell, Volume2, VolumeX, AlertTriangle, Crosshair, ExternalLink, Copy, Check } from 'lucide-react';
 import { initAuth, googleSignIn, logout, writePatientsToSheet, readPatientsFromSheet } from './services/sheetsService';
+import firebaseConfig from './firebase-applet-config.json';
 
 const App: React.FC = () => {
   // Real-time synchronization states through Server-authoritative WebSocket
@@ -25,11 +26,27 @@ const App: React.FC = () => {
   const [patientToDelete, setPatientToDelete] = useState<Patient | null>(null);
   const prevPatientsRef = useRef<Patient[]>([]);
 
-  // Google Sheets integration state
-  const [googleUser, setGoogleUser] = useState<any>(null);
-  const [googleToken, setGoogleToken] = useState<string | null>(null);
+  // Google Sheets integration state with Zero Firebase Dependency
   const [isSyncingSheet, setIsSyncingSheet] = useState(false);
   const [sheetSyncMessage, setSheetSyncMessage] = useState<string>('');
+  const [copiedDomain, setCopiedDomain] = useState(false);
+  const [isAuthDomainModalOpen, setIsAuthDomainModalOpen] = useState(false);
+  
+  // Choose connecting method: 'apps_script' or 'token'
+  const [activeSheetsMethod, setActiveSheetsMethod] = useState<'apps_script' | 'token'>(() => {
+    return (localStorage.getItem('electriguard_sheets_method') as 'apps_script' | 'token') || 'apps_script';
+  });
+
+  const [appsScriptUrl, setAppsScriptUrl] = useState(() => {
+    return localStorage.getItem('electriguard_apps_script_url') || '';
+  });
+
+  const [manualToken, setManualToken] = useState(() => {
+    return localStorage.getItem('electriguard_manual_token') || '';
+  });
+
+  const [appsScriptCodeCopied, setAppsScriptCodeCopied] = useState(false);
+  const [isInstructionsOpen, setIsInstructionsOpen] = useState(false);
 
   const [spreadsheetId, setSpreadsheetId] = useState(() => {
     return localStorage.getItem('electriguard_spreadsheet_id') || '11W01ZXTNRR3uZUHgsfpt7NwbPTiOAdOOZUvtKKOyLbM';
@@ -191,22 +208,54 @@ const App: React.FC = () => {
   }, [plannedZone, isSimulationEnabled, spreadsheetId]);
 
   const handleExportToSheet = async () => {
-    if (!googleToken) return;
     try {
       setIsSyncingSheet(true);
       setSheetSyncMessage("📤 กำลังส่งออกข้อมูลพิกัดขึ้น Google Sheets...");
-      
-      if (googleToken === 'SERVER_MANAGED') {
-        const res = await fetch("/api/sheets/force-sync", { method: "POST" });
+
+      if (activeSheetsMethod === 'apps_script') {
+        if (!appsScriptUrl) {
+          throw new Error("กรุณาระบุ Google Apps Script Web App URL ก่อนกดดำเนินการ");
+        }
+        
+        // Persist on server
+        await fetch("/api/sheets/apps-script-config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: appsScriptUrl })
+        });
+
+        const res = await fetch("/api/sheets/apps-script-proxy", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: appsScriptUrl, patients })
+        });
+        
         if (!res.ok) {
           const errData = await res.json();
-          throw new Error(errData.error || "Force sync failed");
+          throw new Error(errData.error || "Web App Sync Failed");
         }
+        
+        setSheetSyncMessage("✅ ส่งออกข้อมูลผู้ป่วยไปยัง Google Sheets ผ่าน Web App สำเร็จ!");
       } else {
-        await writePatientsToSheet(spreadsheetId, googleToken, patients);
+        // Direct Access Token
+        if (!manualToken) {
+          throw new Error("กรุณาระบุ Google Access Token ก่อนกดดำเนินการ");
+        }
+        
+        // Save the manual token dynamically onto server side so server-side proxy is armed
+        await fetch("/api/sheets/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            accessToken: manualToken,
+            email: "manual-token@lifeguard.pea",
+            spreadsheetId: spreadsheetId
+          })
+        });
+
+        await writePatientsToSheet(spreadsheetId, manualToken, patients);
+        setSheetSyncMessage("✅ อัปโหลดและเขียนข้อมูลลง Google Sheets (Direct Token) เรียบร้อย!");
       }
-      
-      setSheetSyncMessage("✅ อัปโหลดและเขียนข้อมูลลง Google Sheets เรียบร้อย!");
     } catch (err: any) {
       console.error("[Google Sheets] Export failed:", err);
       setSheetSyncMessage(`❌ อัปโหลดล้มเหลว: ${err.message || err}`);
@@ -217,28 +266,70 @@ const App: React.FC = () => {
   };
 
   const handleImportFromSheet = async () => {
-    if (!googleToken) return;
     try {
       setIsSyncingSheet(true);
       setSheetSyncMessage("📥 กำลังดึงข้อมูลจาก Google Sheets...");
-      
-      if (googleToken === 'SERVER_MANAGED') {
-        const res = await fetch("/api/sheets/import", { method: "POST" });
+
+      if (activeSheetsMethod === 'apps_script') {
+        if (!appsScriptUrl) {
+          throw new Error("กรุณาระบุ Google Apps Script Web App URL ก่อนกดดำเนินการ");
+        }
+
+        // Persist on server
+        await fetch("/api/sheets/apps-script-config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: appsScriptUrl })
+        });
+        
+        const res = await fetch(`/api/sheets/apps-script-proxy?url=${encodeURIComponent(appsScriptUrl)}`);
         if (!res.ok) {
           const errData = await res.json();
-          throw new Error(errData.error || "Server-side import failed");
+          throw new Error(errData.error || "Web App Sync Failed");
         }
+        
         const data = await res.json();
-        if (data.patients && data.patients.length > 0) {
-          setPatients(data.patients);
-          setSheetSyncMessage("🚀 ดึงฐานข้อมูลผู้ป่วยจากแผ่นงานเข้ามาเรียบร้อย!");
+        if (data.status === "success" && data.patients) {
+          // Send backup update to backend
+          const saveRes = await fetch("/api/restore", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              patients: data.patients,
+              plannedZone: plannedZone,
+              isSimulationEnabled: isSimulationEnabled,
+              lastUpdated: new Date().toISOString()
+            })
+          });
+          
+          if (saveRes.ok) {
+            setPatients(data.patients);
+            setSheetSyncMessage("🚀 ดึงฐานข้อมูลผู้ป่วยผ่าน Apps Script เรียบร้อย!");
+          } else {
+            setSheetSyncMessage("❌ ข้อผิดพลาดในการจัดเก็บเข้าคลาวด์เมนเฟรม");
+          }
         } else {
-          setSheetSyncMessage("⚠️ ไม่พบข้อมูลผู้ป่วยใดๆ ในกระดาษแผ่นคำนวณที่ระบุ");
+          setSheetSyncMessage("⚠️ ไม่พบข้อมูลผู้ป่วยใดๆ ในแผ่นคำนวณที่ระบุ");
         }
       } else {
-        const sheetPatients = await readPatientsFromSheet(spreadsheetId, googleToken);
+        // Direct Access Token
+        if (!manualToken) {
+          throw new Error("กรุณาระบุ Google Access Token ก่อนกดดำเนินการ");
+        }
+
+        // Save manual token proxy details
+        await fetch("/api/sheets/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            accessToken: manualToken,
+            email: "manual-token@lifeguard.pea",
+            spreadsheetId: spreadsheetId
+          })
+        });
+
+        const sheetPatients = await readPatientsFromSheet(spreadsheetId, manualToken);
         if (sheetPatients && sheetPatients.length > 0) {
-          // Push the entire registry list to our backend server
           const res = await fetch("/api/restore", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -252,7 +343,7 @@ const App: React.FC = () => {
           
           if (res.ok) {
             setPatients(sheetPatients);
-            setSheetSyncMessage("🚀 ดึงฐานข้อมูลผู้ป่วยจากแผ่นงานเข้ามาเรียบร้อย!");
+            setSheetSyncMessage("🚀 ดึงฐานข้อมูลผู้ป่วยจากแผ่นงานสำเร็จ!");
           } else {
             setSheetSyncMessage("❌ ข้อผิดพลาดในการจัดเก็บเข้าคลาวด์เมนเฟรม");
           }
@@ -270,88 +361,58 @@ const App: React.FC = () => {
   };
 
   const handleConnectGoogleSheets = async () => {
-    try {
-      setIsSyncingSheet(true);
-      const result = await googleSignIn();
-      if (result) {
-        setGoogleUser(result.user);
-        setGoogleToken(result.accessToken);
-        
-        // Synchronise the access token with the server-side proxy
-        await fetch("/api/sheets/config", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            accessToken: result.accessToken,
-            email: result.user.email,
-            spreadsheetId: spreadsheetId
-          })
-        }).catch(err => console.error("Error setting server-side sheets credentials:", err));
-
-        await syncWithGoogleSheet(result.accessToken, patients);
-      }
-    } catch (err: any) {
-      console.error("Google Sign-In failed:", err);
-      setSheetSyncMessage(`❌ ล็อกอินล้มเหลว: ${err.message || err}`);
-    } finally {
-      setIsSyncingSheet(false);
-    }
+    // Legacy Google popup auth deactivated. Inform user.
+    setSheetSyncMessage("💡 กรุณาระบุรายละเอียดการเชื่อมต่อในส่วนควบคุมในแท็บควบคุม");
+    setTimeout(() => setSheetSyncMessage(''), 4000);
   };
 
   const handleDisconnectGoogleSheets = async () => {
-    await logout();
-    setGoogleUser(null);
-    setGoogleToken(null);
+    setAppsScriptUrl('');
+    setManualToken('');
+    localStorage.removeItem('electriguard_apps_script_url');
+    localStorage.removeItem('electriguard_manual_token');
     
-    // Clear credentials on the server proxy too
     await fetch("/api/sheets/disconnect", { method: "POST" })
       .catch(err => console.error("Error clearing server-side sheets credentials:", err));
-    
+      
+    await fetch("/api/sheets/apps-script-config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "" })
+    }).catch(err => console.error("Error clearing server-side Apps Script config:", err));
+
     setSheetSyncMessage("👋 ตัดการเชื่อมต่อ Google Sheets แล้ว");
     setTimeout(() => setSheetSyncMessage(''), 3000);
   };
 
-  // Restores Google Auth Session state on load
+  // Restores Google Apps Script and custom parameters on load
   useEffect(() => {
-    const unsubscribe = initAuth(
-      async (user, token) => {
-        setGoogleUser(user);
-        setGoogleToken(token);
-        console.log("Google Sheets session restored client-side:", user.email);
-
-        // Update server with the restored token
-        await fetch("/api/sheets/config", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            accessToken: token,
-            email: user.email,
-            spreadsheetId: spreadsheetId
-          })
-        }).catch(err => console.error("Error syncing restored sessions onto server:", err));
-      },
-      async () => {
-        // If client-side token is empty, check if backend server still holds a stable OAuth registration
-        try {
-          const res = await fetch("/api/sheets/status");
-          if (res.ok) {
-            const data = await res.json();
-            if (data.connected && data.email) {
-              setGoogleUser({ email: data.email } as any);
-              setGoogleToken('SERVER_MANAGED');
-              console.log("Google Sheets session retrieved from server proxy cache:", data.email);
-              return;
-            }
+    const restoreParams = async () => {
+      try {
+        const res = await fetch("/api/sheets/apps-script-status");
+        if (res.ok) {
+          const data = await res.json();
+          if (data.url) {
+            setAppsScriptUrl(data.url);
+            localStorage.setItem('electriguard_apps_script_url', data.url);
           }
-        } catch (serverAuthErr) {
-          console.error("Error querying Sheets sync status from proxy:", serverAuthErr);
         }
         
-        setGoogleUser(null);
-        setGoogleToken(null);
+        const resToken = await fetch("/api/sheets/status");
+        if (resToken.ok) {
+          const dataToken = await resToken.json();
+          if (dataToken.connected && dataToken.spreadsheetId) {
+            // If server cached token is valid, restore configuration attributes
+            setSpreadsheetId(dataToken.spreadsheetId);
+            setSpreadsheetInput(dataToken.spreadsheetId);
+            localStorage.setItem('electriguard_spreadsheet_id', dataToken.spreadsheetId);
+          }
+        }
+      } catch (err) {
+        console.error("Error restoring configuration status on client:", err);
       }
-    );
-    return () => unsubscribe();
+    };
+    restoreParams();
   }, [spreadsheetId]);
 
   // Automatically sync to Google Sheets silently whenever patients state is updated (only when client-managed)
@@ -876,18 +937,18 @@ const App: React.FC = () => {
                     title="สลับโหมดจำลองสถานะภัยไฟฟ้าขัดข้องโดยระบบ"
                   >
                     <span className={`w-1.5 h-1.5 rounded-full ${isSimulationEnabled ? 'bg-indigo-400 animate-pulse' : 'bg-slate-600'}`} />
-                    จำเลียนไฟขัดข้อง: {isSimulationEnabled ? 'เปิดใช้งาน' : 'ปิด'}
+                    จำเลยไฟขัดข้อง: {isSimulationEnabled ? 'เปิดใช้งาน' : 'ปิด'}
                   </button>
                 )}
 
                 {/* Quick Metrics */}
                 <div className="flex gap-2">
-                  <div className="bg-slate-800 px-3 py-1.5 rounded-xl border border-slate-700 flex flex-col items-center">
+                  <div className="bg-slate-800 px-3 py-1.5 rounded-xl border border-slate-700 flex flex-col items-center flex-1">
                     <span className="text-[8px] text-slate-500 font-bold uppercase tracking-wider">วิกฤต (CRITICAL)</span>
                     <span className="text-sm font-black text-rose-500 leading-none mt-1">{totalCritical}</span>
                   </div>
-                  <div className="bg-slate-850 px-3 py-1.5 rounded-xl border border-slate-705 flex flex-col items-center">
-                    <span className="text-[8px] text-slate-550 font-bold uppercase tracking-wider">ไฟดับขัดข้อง</span>
+                  <div className="bg-slate-800 px-3 py-1.5 rounded-xl border border-slate-700 flex flex-col items-center flex-1">
+                    <span className="text-[8px] text-slate-500 font-bold uppercase tracking-wider">ไฟดับขัดข้อง</span>
                     <span className="text-sm font-black text-amber-500 leading-none mt-1">{currentOutages}</span>
                   </div>
                 </div>
@@ -900,7 +961,7 @@ const App: React.FC = () => {
                       setIsPlanningMode(newPlanningVal);
                       updatePlannedZoneSync({ isActive: newPlanningVal });
                     }}
-                    className={`px-4 py-2 rounded-xl font-bold text-xs transition-all flex items-center gap-1.5 border-2
+                    className={`px-4 py-2 rounded-xl font-bold text-xs transition-all flex items-center gap-1.5 border-2 w-full justify-center
                       ${isPlanningMode 
                         ? 'bg-amber-400 border-amber-500 text-slate-900 shadow-md' 
                         : 'bg-slate-800 border-slate-700 text-slate-300 hover:border-slate-600'}`}
@@ -914,87 +975,258 @@ const App: React.FC = () => {
                 {isAdmin && (
                   <button 
                     onClick={() => setIsFormOpen(true)}
-                    className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-xl font-bold text-xs transition-all shadow-lg flex items-center gap-1.5"
+                    className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-xl font-bold text-xs transition-all shadow-lg flex items-center gap-1.5 w-full justify-center"
                   >
                     <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
                     ลงทะเบียนใหม่
                   </button>
                 )}
 
-                {/* Google Sheets Sync Integration */}
-                <div className="flex flex-col gap-1.5 bg-slate-800 rounded-xl p-1.5 border border-slate-700">
-                  <div className="flex items-center gap-1.5">
-                    {googleUser ? (
-                      <div className="flex items-center gap-1.5 w-full justify-between">
-                        <div className="flex flex-col text-left leading-tight pl-1">
-                          <span className="text-[9px] text-emerald-400 font-black">📊 Google Sheets เชื่อมต่อ</span>
-                          <span className="text-[8px] text-slate-400 truncate max-w-[100px]" title={googleUser.email}>{googleUser.email}</span>
-                        </div>
-                        <div className="flex items-center gap-1">
-                          <button
-                            onClick={handleExportToSheet}
-                            disabled={isSyncingSheet}
-                            className="px-2 py-1 bg-emerald-600 hover:bg-emerald-500 disabled:bg-emerald-800 text-white rounded-lg text-[9px] font-black transition-all flex items-center gap-0.5 cursor-pointer animate-pulse"
-                            title="อัปโหลดส่งออกข้อมูลบนอุปกรณ์ขึ้น Google Sheets"
-                          >
-                            📤 ส่งออก
-                          </button>
-                          <button
-                            onClick={handleImportFromSheet}
-                            disabled={isSyncingSheet}
-                            className="px-2 py-1 bg-teal-600 hover:bg-teal-500 disabled:bg-teal-800 text-white rounded-lg text-[9px] font-black transition-all flex items-center gap-0.5 cursor-pointer"
-                            title="ดึงข้อมูลความเห็นจาก Google Sheets เข้าสู่เซิร์ฟเวอร์สำนักงาน"
-                          >
-                            📥 ดึงข้อมูล
-                          </button>
-                          <button
-                            onClick={handleDisconnectGoogleSheets}
-                            className="p-1 text-slate-400 hover:text-rose-400 rounded-lg transition-colors text-[10px] cursor-pointer"
-                            title="ตัดการเชื่อมต่อ Google Sheets"
-                          >
-                            ❌
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <button
-                        onClick={handleConnectGoogleSheets}
-                        disabled={isSyncingSheet}
-                        className="w-full px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-800 text-white rounded-lg text-[10px] font-black tracking-tight transition-all flex items-center justify-center gap-1.5 cursor-pointer"
-                        title="ล็อกอินด้วย Google เพื่อบันทึกประวัติผู้ป่วยลงแผ่นคำนวณอัตโนมัติ"
-                      >
-                        <svg viewBox="0 0 48 48" className="w-3.5 h-3.5 fill-current">
-                          <path d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
-                          <path d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
-                          <path d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
-                          <path d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
-                        </svg>
-                        {isSyncingSheet ? 'กำลังเชื่อมต่อ...' : 'เชื่อมต่อ Google Sheets 📊'}
-                      </button>
-                    )}
+                {/* Google Sheets Sync Integration (Zero Firebase Dependency) */}
+                <div className="flex flex-col gap-2 bg-slate-800 rounded-xl p-2.5 border border-slate-700 w-full text-slate-200">
+                  <div className="flex flex-col gap-1 text-left">
+                    <span className="text-[10px] text-emerald-400 font-extrabold flex items-center gap-1.5 leading-none">📊 ระบบทำงานร่วมกับ Google Sheets</span>
+                    <span className="text-[8px] text-slate-400 leading-normal font-bold">เลือกสไตล์การเชื่อมต่อของคุณ (ไม่มีเออเร่อแอดโดเมน)</span>
                   </div>
 
-                  {/* Input for Google Sheet ID or URL */}
-                  <div className="flex flex-col gap-1 border-t border-slate-700/60 pt-1.5 mt-0.5 w-full">
-                    <label className="text-[8px] text-slate-450 font-bold leading-normal flex justify-between">
-                      <span>🔗 ลิงก์หรือ ID ของ Google Sheets ของคุณ:</span>
-                      {spreadsheetId !== '11W01ZXTNRR3uZUHgsfpt7NwbPTiOAdOOZUvtKKOyLbM' && (
-                        <button
-                          onClick={() => handleSheetIdChange('https://docs.google.com/spreadsheets/d/11W01ZXTNRR3uZUHgsfpt7NwbPTiOAdOOZUvtKKOyLbM/edit')}
-                          className="text-amber-400 hover:underline hover:text-amber-300 font-extrabold cursor-pointer"
-                        >
-                          คืนค่าเริ่มต้น
-                        </button>
-                      )}
-                    </label>
-                    <input
-                      type="text"
-                      value={spreadsheetInput}
-                      onChange={(e) => handleSheetIdChange(e.target.value)}
-                      placeholder="วางลิงก์ Google Sheets ของคุณหรือชีตไอดี..."
-                      className="w-full bg-slate-900 border border-slate-705 rounded px-1.5 py-0.5 text-[9px] text-emerald-300 focus:outline-none focus:border-emerald-500 font-mono"
-                    />
+                  {/* Settings Mode Selector Buttons */}
+                  <div className="grid grid-cols-2 gap-1 bg-slate-900/60 p-0.5 rounded-lg border border-slate-700">
+                    <button
+                      onClick={() => {
+                        setActiveSheetsMethod('apps_script');
+                        localStorage.setItem('electriguard_sheets_method', 'apps_script');
+                      }}
+                      className={`py-1 text-[8px] font-black rounded transition-all cursor-pointer ${activeSheetsMethod === 'apps_script' ? 'bg-emerald-600 text-white shadow-md' : 'text-slate-400 hover:text-slate-200'}`}
+                    >
+                      🚀 Apps Script (แนะนำ)
+                    </button>
+                    <button
+                      onClick={() => {
+                        setActiveSheetsMethod('token');
+                        localStorage.setItem('electriguard_sheets_method', 'token');
+                      }}
+                      className={`py-1 text-[8px] font-black rounded transition-all cursor-pointer ${activeSheetsMethod === 'token' ? 'bg-emerald-600 text-white shadow-md' : 'text-slate-400 hover:text-slate-200'}`}
+                    >
+                      🔑 API Token (ขั้นสูง)
+                    </button>
                   </div>
+
+                  {/* Mode A Elements: Apps Script Web App URL */}
+                  {activeSheetsMethod === 'apps_script' && (
+                    <div className="flex flex-col gap-1 text-left">
+                      <label className="text-[8px] text-slate-400 font-bold flex justify-between">
+                        <span>🔗 วาง Google Apps Script Web App URL:</span>
+                        {appsScriptUrl && (
+                          <button
+                            onClick={() => {
+                              setAppsScriptUrl('');
+                              localStorage.removeItem('electriguard_apps_script_url');
+                            }}
+                            className="text-rose-450 hover:underline font-extrabold cursor-pointer"
+                          >
+                            ล้างค่า
+                          </button>
+                        )}
+                      </label>
+                      <input
+                        type="text"
+                        value={appsScriptUrl}
+                        onChange={(e) => {
+                          const val = e.target.value.trim();
+                          setAppsScriptUrl(val);
+                          localStorage.setItem('electriguard_apps_script_url', val);
+                          fetch("/api/sheets/apps-script-config", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ url: val })
+                          });
+                        }}
+                        placeholder="https://script.google.com/macros/s/.../exec"
+                        className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[9px] text-emerald-300 focus:outline-none focus:border-emerald-500 font-mono"
+                      />
+
+                      {/* Manual script guideline dropdown */}
+                      <button
+                        onClick={() => setIsInstructionsOpen(!isInstructionsOpen)}
+                        className="w-full text-center mt-1 py-1 bg-slate-900 hover:bg-slate-850 border border-slate-700 text-[8px] font-black text-amber-400 rounded-lg transition-colors flex items-center justify-center gap-1 cursor-pointer"
+                      >
+                        <span>{isInstructionsOpen ? '▲ ปิดคำแนะนำการตั้งค่า' : '📋 เปิดดูคู่มือคัดลอกสคริปต์ลง Google Sheets'}</span>
+                      </button>
+
+                      {isInstructionsOpen && (
+                        <div className="bg-slate-900 p-2 rounded-lg border border-slate-700 mt-1 text-[8px] leading-relaxed text-slate-350 space-y-1.5 max-h-[170px] overflow-y-auto font-sans">
+                          <p className="font-bold text-amber-400">💡 ขั้นตอนการเชื่อมต่อใน 1 นาที:</p>
+                          <ol className="list-decimal pl-3 space-y-1">
+                            <li>เปิด Google Sheet เปล่าของท่านขึ้นมา</li>
+                            <li>บนเมนูด้านบน กดเลือก <strong>ส่วนขยาย (Extensions)</strong> &gt; <strong>Apps Script</strong></li>
+                            <li>ลบโค้ดเดิมทั้งหมดใน Editor ทิ้ง แล้วใช้ปุ่มด้านล่างนี้เพื่อคัดลอกสคริปต์ไปวาง</li>
+                            <li>กดปุ่ม <strong>ทำให้ใช้งานได้ (Deploy)</strong> &gt; เลือก <strong>การเผยแพร่ใหม่ (New deployment)</strong></li>
+                            <li>เลือกไอคอนเกียร์ &gt; <strong>เว็บแอป (Web App)</strong></li>
+                            <li>ในช่อง <span className="text-slate-100">"ผู้ที่มีสิทธิ์เข้าถึง (Who has access)"</span> เลือกเป็น <strong>"ทุกคน (Anyone)"</strong></li>
+                            <li>กด Deploy &gt; กดยินยอมสิทธิ์บัญชีจนเสร็จ &gt; คัดลอก URL เว็บแอปที่ได้รับมาใส่ในช่องด้านบน</li>
+                          </ol>
+
+                          {/* Code Copy Button */}
+                          <button
+                            onClick={() => {
+                              const scriptSnippet = `function doPost(e) {
+  try {
+    var data = JSON.parse(e.postData.contents);
+    var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheets()[0];
+    sheet.clear();
+    var headers = ['ID', 'ชื่อ-นามสกุล', 'อายุ', 'ระดับวิกฤตความปลอดภัย', 'สถานะกระแสไฟ', 'โรคประจำตัว/ข้อจำกัดพยาบาล', 'อุปกรณ์ช่วยเลี่ยงความเสี่ยง', 'ที่อยู่', 'เบอร์ติดต่อประสานงาน', 'ละติจูด', 'ลองจิจูด', 'ปรับปรุงล่าสุด'];
+    sheet.appendRow(headers);
+    if (data.patients && data.patients.length > 0) {
+      for (var i = 0; i < data.patients.length; i++) {
+        var p = data.patients[i];
+        var equip = p.equipment ? p.equipment.join('|') : '';
+        sheet.appendRow([p.id || '', p.name || '', p.age !== undefined ? p.age.toString() : '', p.priority || 'LOW', p.status || 'NORMAL', p.condition || '', equip, p.address || '', p.contact || '', p.coordinates && p.coordinates.lat ? p.coordinates.lat.toString() : '', p.coordinates && p.coordinates.lng ? p.coordinates.lng.toString() : '', p.lastUpdated || new Date().toISOString()]);
+      }
+    }
+    return ContentService.createTextOutput(JSON.stringify({ status: "success", count: data.patients.length })).setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({ status: "error", message: err.toString() })).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+function doGet(e) {
+  try {
+    var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheets()[0];
+    var values = sheet.getDataRange().getValues();
+    if (values.length <= 1) {
+      return ContentService.createTextOutput(JSON.stringify({ status: "success", patients: [] })).setMimeType(ContentService.MimeType.JSON);
+    }
+    var patients = [];
+    for (var i = 1; i < values.length; i++) {
+      var row = values[i];
+      var ageVal = parseInt(row[2]);
+      var latVal = parseFloat(row[9]);
+      var lngVal = parseFloat(row[10]);
+      var equipStr = row[6] || '';
+      patients.push({
+        id: row[0] || ("pat_" + i + "_" + Math.floor(Math.random()*10000)),
+        name: row[1] || '',
+        age: isNaN(ageVal) ? 0 : ageVal,
+        priority: row[3] || 'LOW',
+        status: row[4] || 'NORMAL',
+        condition: row[5] || '',
+        equipment: equipStr ? equipStr.split('|').filter(Boolean) : [],
+        address: row[7] || '',
+        contact: row[8] || '',
+        coordinates: { lat: isNaN(latVal) ? 12.6814 : latVal, lng: isNaN(lngVal) ? 101.2813 : lngVal },
+        lastUpdated: row[11] || new Date().toISOString()
+      });
+    }
+    return ContentService.createTextOutput(JSON.stringify({ status: "success", patients: patients })).setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({ status: "error", message: err.toString() })).setMimeType(ContentService.MimeType.JSON);
+  }
+}`;
+                              navigator.clipboard.writeText(scriptSnippet);
+                              setAppsScriptCodeCopied(true);
+                              setTimeout(() => setAppsScriptCodeCopied(false), 2000);
+                            }}
+                            className={`w-full font-black py-1 rounded border text-[8px] transition-all cursor-pointer ${appsScriptCodeCopied ? 'bg-emerald-600 border-emerald-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-750'}`}
+                          >
+                            {appsScriptCodeCopied ? '✓ คัดลอกโค้ดสำเร็จ!' : '📋 คลิกเพื่อคัดลอก Apps Script Code'}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Mode B Elements: Direct Web Access Token */}
+                  {activeSheetsMethod === 'token' && (
+                    <div className="flex flex-col gap-1 w-full text-left">
+                      <div className="flex flex-col gap-0.5">
+                        <label className="text-[8px] text-slate-400 font-bold flex justify-between">
+                          <span>🔗 ลิงก์หรือ ID ของ Google Sheets ของคุณ:</span>
+                          {spreadsheetId !== '11W01ZXTNRR3uZUHgsfpt7NwbPTiOAdOOZUvtKKOyLbM' && (
+                            <button
+                              onClick={() => handleSheetIdChange('https://docs.google.com/spreadsheets/d/11W01ZXTNRR3uZUHgsfpt7NwbPTiOAdOOZUvtKKOyLbM/edit')}
+                              className="text-amber-400 hover:underline font-bold cursor-pointer"
+                            >
+                              คืนค่าเริ่มต้น
+                            </button>
+                          )}
+                        </label>
+                        <input
+                          type="text"
+                          value={spreadsheetInput}
+                          onChange={(e) => handleSheetIdChange(e.target.value)}
+                          placeholder="วางลิงก์ Google Sheets ของคุณ..."
+                          className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-[8px] text-slate-200 focus:outline-none focus:border-emerald-500 font-mono"
+                        />
+                      </div>
+
+                      <div className="flex flex-col gap-0.5 mt-1">
+                        <label className="text-[8px] text-slate-400 font-bold">
+                          <span>🔑 วาง Google OAuth Access Token ของคุณ:</span>
+                        </label>
+                        <input
+                          type="password"
+                          value={manualToken}
+                          onChange={(e) => {
+                            const val = e.target.value.trim();
+                            setManualToken(val);
+                            localStorage.setItem('electriguard_manual_token', val);
+                            fetch("/api/sheets/config", {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({
+                                accessToken: val,
+                                email: "manual-token@lifeguard.pea",
+                                spreadsheetId: spreadsheetId
+                              })
+                            });
+                          }}
+                          placeholder="ya29.a0Axoo..."
+                          className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-[8px] text-yellow-300 focus:outline-none focus:border-yellow-500 font-mono"
+                          title="คุณสามารถขอรับ Access Token ชั่วคราวได้จาก Google OAuth Playground เพื่อนำมาเชื่อมตรงโดยตรงในแดชบอร์ดทดสอบ"
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Operational Sync Action Controls */}
+                  <div className="grid grid-cols-2 gap-1 border-t border-slate-700/60 pt-1.5 mt-0.5 w-full">
+                    <button
+                      onClick={handleExportToSheet}
+                      disabled={isSyncingSheet}
+                      className="px-2 py-1 bg-emerald-600 hover:bg-emerald-500 disabled:bg-emerald-800 text-white rounded-lg text-[9px] font-black transition-all flex items-center justify-center gap-0.5 cursor-pointer"
+                      title="อัปโหลดส่งออกข้อมูลบนอุปกรณ์ขึ้น Google Sheets"
+                    >
+                      📤 ส่งออกข้อมูล
+                    </button>
+                    <button
+                      onClick={handleImportFromSheet}
+                      disabled={isSyncingSheet}
+                      className="px-2 py-1 bg-teal-600 hover:bg-teal-500 disabled:bg-teal-800 text-white rounded-lg text-[9px] font-black transition-all flex items-center justify-center gap-0.5 cursor-pointer"
+                      title="ดึงข้อมูลความเห็นจาก Google Sheets เข้าสู่เซิร์ฟเวอร์สำนักงาน"
+                    >
+                      📥 ดึงข้อมูลชีต
+                    </button>
+                  </div>
+                  
+                  {activeSheetsMethod === 'apps_script' && appsScriptUrl && (
+                    <div className="text-center mt-1">
+                      <button
+                        onClick={handleDisconnectGoogleSheets}
+                        className="text-[8px] text-slate-500 hover:text-rose-400 underline cursor-pointer"
+                      >
+                        ตัดการเชื่อมต่อสะพานเชื่อมต่อชีต
+                      </button>
+                    </div>
+                  )}
+                  {activeSheetsMethod === 'token' && manualToken && (
+                    <div className="text-center mt-1">
+                      <button
+                        onClick={handleDisconnectGoogleSheets}
+                        className="text-[8px] text-slate-500 hover:text-rose-400 underline cursor-pointer"
+                      >
+                        ล้างค่าโทเค็นบัญชีเชื่อมตรง
+                      </button>
+                    </div>
+                  )}
                 </div>
 
                 {/* Logout Button */}
@@ -1829,6 +2061,105 @@ const App: React.FC = () => {
                 className="w-full py-4 bg-slate-100 hover:bg-slate-200 text-slate-500 font-bold rounded-2xl text-xs transition-all"
               >
                 ยกเลิก
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Firebase Authorized Domain Guideline Modal */}
+      {isAuthDomainModalOpen && (
+        <div className="fixed inset-0 bg-slate-900/80 backdrop-blur-md flex items-center justify-center z-[130] p-4 animate-fade-in">
+          <div className="bg-white rounded-[32px] shadow-2xl max-w-lg w-full p-8 border border-slate-100 space-y-6 text-left animate-scale-up">
+            <div className="flex items-center gap-3 border-b border-slate-100 pb-4">
+              <div className="w-12 h-12 bg-red-50 text-red-600 rounded-2xl flex items-center justify-center shadow-inner">
+                <AlertTriangle size={24} />
+              </div>
+              <div className="flex-1">
+                <h3 className="text-lg font-black text-slate-800 leading-tight">พบปัญหาโดเมนยังไม่ได้รับอนุญาต (auth/unauthorized-domain)</h3>
+                <p className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mt-0.5">Firebase Security Guideline</p>
+              </div>
+              <button 
+                onClick={() => {
+                  setIsAuthDomainModalOpen(false);
+                  setCopiedDomain(false);
+                }} 
+                className="p-1 hover:bg-slate-100 rounded-lg text-slate-400 hover:text-slate-600 font-bold transition-colors cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-600 leading-relaxed">
+              เนื่องจากคุณกำลังใช้งานแอปพลิเคชันผ่านโดเมน <span className="font-extrabold text-blue-600 bg-blue-50 px-2 py-0.5 rounded-lg text-xs">{window.location.hostname}</span> ซึ่งยังไม่ได้ลงทะเบียนในระบบอนุญาตของโครงการ <strong>Google Firebase Auth ({firebaseConfig.projectId})</strong>
+            </p>
+
+            <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100 space-y-3">
+              <span className="text-[10px] uppercase font-black tracking-wider text-slate-505">ขั้นตอนการอนุญาตโดเมน (Authorized Domains)</span>
+              
+              <div className="space-y-2.5 text-xs text-slate-600 leading-relaxed">
+                <p className="flex items-start gap-2">
+                  <span className="w-5 h-5 rounded-full bg-slate-200 text-slate-700 flex items-center justify-center font-bold text-[10px] flex-shrink-0 mt-0.5">1</span>
+                  <span>
+                    คลิกปุ่มด้านล่างเพื่อเปิดหน้าจัดการ <strong>Authorized domains</strong> บนแดชบอร์ด Firebase Console ของโครงการคุณ
+                  </span>
+                </p>
+                <p className="flex items-start gap-2">
+                  <span className="w-5 h-5 rounded-full bg-slate-200 text-slate-700 flex items-center justify-center font-bold text-[10px] flex-shrink-0 mt-0.5">2</span>
+                  <span>
+                    ในแถบ <strong>Settings</strong> &gt; เลื่อนลงมาที่หมวดหมู่ <strong>Authorized domains</strong> และกดคลิกปุ่ม <strong>[Add domain]</strong>
+                  </span>
+                </p>
+                <p className="flex items-start gap-2">
+                  <span className="w-5 h-5 rounded-full bg-slate-200 text-slate-700 flex items-center justify-center font-bold text-[10px] flex-shrink-0 mt-0.5">3</span>
+                  <span>
+                    นำชื่อโดเมนหลักที่คัดลอกไว้ไปกรอกเพิ่ม <em>(ห้ามพิมพ์ <code>https://</code> หรือเครื่องหมาย / ปิดท้าย ให้ใช้เฉพาะตามที่คัดลอกด้านล่างนี้)</em> แล้วกดบันทึก <strong>Save</strong>
+                  </span>
+                </p>
+              </div>
+
+              {/* Copy Hostname Section */}
+              <div className="pt-2">
+                <div className="bg-white border border-slate-200 rounded-xl px-3 py-2 flex items-center justify-between text-xs font-mono text-slate-700">
+                  <span className="select-all font-bold text-slate-900">{window.location.hostname}</span>
+                  <button
+                    onClick={() => {
+                      navigator.clipboard.writeText(window.location.hostname);
+                      setCopiedDomain(true);
+                      setTimeout(() => setCopiedDomain(false), 2000);
+                    }}
+                    className="p-1 hover:bg-slate-100 rounded-lg text-slate-500 hover:text-slate-700 transition-all flex items-center gap-1 cursor-pointer"
+                    title="คัดลอกชื่อโดเมน"
+                  >
+                    {copiedDomain ? (
+                      <Check size={14} className="text-emerald-500" />
+                    ) : (
+                      <Copy size={14} />
+                    )}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-col sm:flex-row gap-2 pt-2">
+              <a
+                href={`https://console.firebase.google.com/project/${firebaseConfig.projectId}/authentication/providers`}
+                target="_blank"
+                rel="referrer noopener"
+                className="flex-1 py-3.5 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold rounded-2xl text-xs transition-all shadow-lg shadow-emerald-600/20 flex items-center justify-center gap-2"
+              >
+                <span>เปิดหน้าตั้งค่าใน Firebase Console</span>
+                <ExternalLink size={14} />
+              </a>
+              <button 
+                type="button"
+                onClick={() => {
+                  setIsAuthDomainModalOpen(false);
+                  setCopiedDomain(false);
+                }}
+                className="py-3.5 px-6 bg-slate-100 hover:bg-slate-200 text-slate-500 font-bold rounded-2xl text-xs transition-all cursor-pointer"
+              >
+                ปิดหน้าต่าง
               </button>
             </div>
           </div>

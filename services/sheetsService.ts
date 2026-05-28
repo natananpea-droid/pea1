@@ -1,60 +1,25 @@
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, User } from 'firebase/auth';
-import firebaseConfig from '../firebase-applet-config.json';
-
-// Initialize secondary client-side Firebase Auth
-const app = initializeApp(firebaseConfig);
-export const auth = getAuth(app);
-
-const provider = new GoogleAuthProvider();
-provider.addScope('https://www.googleapis.com/auth/spreadsheets');
-
 // Cache the access token in memory
 let cachedAccessToken: string | null = null;
-let isSigningIn = false;
 
+// Mock authentications since we are removing Firebase Auth to prevent 'unauthorized-domain' issues
 export const initAuth = (
-  onAuthSuccess?: (user: User, token: string) => void,
+  onAuthSuccess?: (user: any, token: string) => void,
   onAuthFailure?: () => void
 ) => {
-  return onAuthStateChanged(auth, async (user: User | null) => {
-    if (user) {
-      if (cachedAccessToken) {
-        if (onAuthSuccess) onAuthSuccess(user, cachedAccessToken);
-      } else if (!isSigningIn) {
-        cachedAccessToken = null;
-        if (onAuthFailure) onAuthFailure();
-      }
-    } else {
-      cachedAccessToken = null;
-      if (onAuthFailure) onAuthFailure();
-    }
-  });
+  // Silent fallback - no active Firebase Session
+  if (onAuthFailure) onAuthFailure();
+  return () => {};
 };
 
-export const googleSignIn = async (): Promise<{ user: User; accessToken: string } | null> => {
-  try {
-    isSigningIn = true;
-    const result = await signInWithPopup(auth, provider);
-    const credential = GoogleAuthProvider.credentialFromResult(result);
-    if (!credential?.accessToken) {
-      throw new Error('Failed to obtain Google access token');
-    }
-    cachedAccessToken = credential.accessToken;
-    return { user: result.user, accessToken: cachedAccessToken };
-  } catch (error: any) {
-    console.error('Google Sign-In Error:', error);
-    throw error;
-  } finally {
-    isSigningIn = false;
-  }
+export const googleSignIn = async (): Promise<{ user: any; accessToken: string } | null> => {
+  throw new Error('Google Sign-In with Firebase Auth is disabled. Please use Google Apps Script Web App or a direct Access Token.');
 };
 
 export const logout = async () => {
-  await auth.signOut();
   cachedAccessToken = null;
 };
 
+// Original Google Sheets API Fetch integration (Can still be used if a direct access token is supplied)
 export async function getFirstSheetName(spreadsheetId: string, accessToken: string): Promise<string> {
   const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=sheets.properties`;
   const res = await fetch(url, {
