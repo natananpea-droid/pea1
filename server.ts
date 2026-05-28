@@ -8,25 +8,11 @@ import { GoogleGenAI, Type } from "@google/genai";
 import { initializeApp } from "firebase/app";
 import { getFirestore, collection, getDocs, doc, setDoc, deleteDoc, getDoc } from "firebase/firestore";
 
-// Initialize Firebase safely inside a try-catch block to prevent server-crash if config is invalid/missing
-let db: any = null;
-try {
-  const firebaseConfigPath = path.join(process.cwd(), "firebase-applet-config.json");
-  if (fs.existsSync(firebaseConfigPath)) {
-    const firebaseConfig = JSON.parse(fs.readFileSync(firebaseConfigPath, "utf8"));
-    if (firebaseConfig && firebaseConfig.projectId) {
-      const firebaseApp = initializeApp(firebaseConfig);
-      db = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
-      console.log("[Firebase] Successfully initialized Firestore client.");
-    } else {
-      console.warn("[Firebase] Warning: Config was found but lacks needed fields. Falling back to local db.json.");
-    }
-  } else {
-    console.warn("[Firebase] Warning: firebase-applet-config.json not found. Falling back to local db.json.");
-  }
-} catch (err) {
-  console.error("[Firebase] Error during Firebase initialization:", err);
-}
+// Initialize Firebase using the configuration credentials
+const firebaseConfigPath = path.join(process.cwd(), "firebase-applet-config.json");
+const firebaseConfig = JSON.parse(fs.readFileSync(firebaseConfigPath, "utf8"));
+const firebaseApp = initializeApp(firebaseConfig);
+const db = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
 
 // Standard Express + Http Server
 const app = express();
@@ -72,33 +58,8 @@ let lastUpdated = new Date().toISOString();
 let googleAccessToken: string | null = null;
 let googleUserEmail: string | null = null;
 let savedSpreadsheetId: string = "11W01ZXTNRR3uZUHgsfpt7NwbPTiOAdOOZUvtKKOyLbM";
-let googleAppsScriptUrl: string = "";
 
 const DB_FILE = path.join(process.cwd(), "db.json");
-
-function loadDBLocalFallback() {
-  try {
-    if (fs.existsSync(DB_FILE)) {
-      const data = JSON.parse(fs.readFileSync(DB_FILE, "utf-8"));
-      if (data.patients) patients = data.patients;
-      if (data.plannedZone) plannedZone = data.plannedZone;
-      if (data.isSimulationEnabled !== undefined) isSimulationEnabled = data.isSimulationEnabled;
-      if (data.lastUpdated) lastUpdated = data.lastUpdated;
-      if (data.googleAccessToken) googleAccessToken = data.googleAccessToken;
-      if (data.googleUserEmail) googleUserEmail = data.googleUserEmail;
-      if (data.savedSpreadsheetId) savedSpreadsheetId = data.savedSpreadsheetId;
-      if (data.googleAppsScriptUrl) googleAppsScriptUrl = data.googleAppsScriptUrl;
-      console.log(`[Local DB] Successfully loaded ${patients.length} patients and settings from db.json.`);
-    } else {
-      console.log("[Local DB] No local db.json found. System will start with standard defaults.");
-    }
-  } catch (err) {
-    console.error("[Local DB] Failed to load local db.json fallback:", err);
-  }
-}
-
-// Load local database right away to make sure the app instantly has high-fidelity offline/cached copy
-loadDBLocalFallback();
 
 function saveDBLocalFallback() {
   try {
@@ -109,8 +70,7 @@ function saveDBLocalFallback() {
       lastUpdated,
       googleAccessToken,
       googleUserEmail,
-      savedSpreadsheetId,
-      googleAppsScriptUrl
+      savedSpreadsheetId
     }, null, 2), "utf-8");
   } catch (err) {
     // Silently skip local fallback write glitches
@@ -118,10 +78,6 @@ function saveDBLocalFallback() {
 }
 
 async function loadDBFromFirestore() {
-  if (!db) {
-    console.log("[Firestore] Integration skipped: Firestore database client is not initialized.");
-    return;
-  }
   try {
     console.log("[Firestore] Booting up, pulling latest data from cloud...");
 
@@ -136,8 +92,7 @@ async function loadDBFromFirestore() {
       if (data.googleAccessToken) googleAccessToken = data.googleAccessToken;
       if (data.googleUserEmail) googleUserEmail = data.googleUserEmail;
       if (data.savedSpreadsheetId) savedSpreadsheetId = data.savedSpreadsheetId;
-      if (data.googleAppsScriptUrl) googleAppsScriptUrl = data.googleAppsScriptUrl;
-      console.log("[Firestore] Global settings loaded successfully:", { isSimulationEnabled, lastUpdated, googleUserEmail, savedSpreadsheetId, googleAppsScriptUrl });
+      console.log("[Firestore] Global settings loaded successfully:", { isSimulationEnabled, lastUpdated, googleUserEmail, savedSpreadsheetId });
     } else {
       // Setup initial settings document
       await setDoc(settingsDocRef, {
@@ -146,8 +101,7 @@ async function loadDBFromFirestore() {
         lastUpdated: new Date().toISOString(),
         googleAccessToken: null,
         googleUserEmail: null,
-        savedSpreadsheetId,
-        googleAppsScriptUrl: ""
+        savedSpreadsheetId
       });
       console.log("[Firestore] Created initial global settings document.");
     }
@@ -221,7 +175,6 @@ async function loadDBFromFirestore() {
 }
 
 async function savePatientToFirestore(patient: any) {
-  if (!db) return;
   try {
     await setDoc(doc(db, "patients", patient.id), patient);
     console.log(`[Firestore] Saved patient ${patient.id} / ${patient.name}`);
@@ -231,7 +184,6 @@ async function savePatientToFirestore(patient: any) {
 }
 
 async function deletePatientFromFirestore(patientId: string) {
-  if (!db) return;
   try {
     await deleteDoc(doc(db, "patients", patientId));
     console.log(`[Firestore] Deleted patient ${patientId}`);
@@ -241,7 +193,6 @@ async function deletePatientFromFirestore(patientId: string) {
 }
 
 async function saveSettingsToFirestore() {
-  if (!db) return;
   try {
     await setDoc(doc(db, "settings", "globalState"), {
       plannedZone,
@@ -249,8 +200,7 @@ async function saveSettingsToFirestore() {
       lastUpdated,
       googleAccessToken,
       googleUserEmail,
-      savedSpreadsheetId,
-      googleAppsScriptUrl
+      savedSpreadsheetId
     });
     console.log("[Firestore] Global settings saved to cloud.");
   } catch (err) {
@@ -543,57 +493,6 @@ app.post("/api/sheets/disconnect", async (req, res) => {
   res.json({ success: true });
 });
 
-// Google Apps Script Proxy and Config endpoints
-app.post("/api/sheets/apps-script-config", async (req, res) => {
-  const { url } = req.body;
-  googleAppsScriptUrl = url || "";
-  await saveSettingsToFirestore();
-  saveDBLocalFallback();
-  res.json({ success: true, url: googleAppsScriptUrl });
-});
-
-app.get("/api/sheets/apps-script-status", (req, res) => {
-  res.json({ url: googleAppsScriptUrl });
-});
-
-app.get("/api/sheets/apps-script-proxy", async (req, res) => {
-  const { url } = req.query;
-  const targetUrl = url || googleAppsScriptUrl;
-  if (!targetUrl) return res.status(400).json({ error: "Missing Google Apps Script Web App URL" });
-  try {
-    const rawRes = await fetch(targetUrl as string);
-    if (!rawRes.ok) throw new Error(`Google Web App returned status ${rawRes.status}`);
-    const data = await rawRes.json();
-    res.json(data);
-  } catch (err: any) {
-    console.error("[Apps Script Proxy GET] failed:", err);
-    res.status(500).json({ error: err.message || "Failed to contact Apps Script Web App" });
-  }
-});
-
-app.post("/api/sheets/apps-script-proxy", async (req, res) => {
-  const { url, patients: clientPatients } = req.body;
-  const targetUrl = url || googleAppsScriptUrl;
-  if (!targetUrl) return res.status(400).json({ error: "Missing Google Apps Script Web App URL" });
-  try {
-    const response = await fetch(targetUrl as string, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ patients: clientPatients || patients })
-    });
-    const textData = await response.text();
-    try {
-      const jsonData = JSON.parse(textData);
-      res.json(jsonData);
-    } catch {
-      res.json({ success: true, message: "Exported successfully!", rawResponse: textData });
-    }
-  } catch (err: any) {
-    console.error("[Apps Script Proxy POST] failed:", err);
-    res.status(500).json({ error: err.message || "Proxy connection to Web App failed" });
-  }
-});
-
 app.post("/api/sheets/force-sync", async (req, res) => {
   if (!googleAccessToken) {
     return res.status(401).json({ error: "Google Sheets is not connected" });
@@ -681,10 +580,8 @@ app.post("/api/sheets/import", async (req, res) => {
     patients = importedPatients;
     
     // Save to Firestore & local
-    if (db) {
-      for (const p of patients) {
-        await setDoc(doc(db, "patients", p.id), p);
-      }
+    for (const p of patients) {
+      await setDoc(doc(db, "patients", p.id), p);
     }
     await saveSettingsToFirestore();
     saveDBLocalFallback();
@@ -774,11 +671,9 @@ app.post("/api/restore", async (req, res) => {
     lastUpdated = clientLastUpdated;
 
     try {
-      // Re-seed all patients in Firestore if available
-      if (db) {
-        for (const p of patients) {
-          await setDoc(doc(db, "patients", p.id), p);
-        }
+      // Re-seed all patients in Firestore
+      for (const p of patients) {
+        await setDoc(doc(db, "patients", p.id), p);
       }
       await saveSettingsToFirestore();
       saveDBLocalFallback();
@@ -855,10 +750,8 @@ app.post("/api/assess", async (req, res) => {
 
 // Start integration with Vite/Production Server Assets
 async function configureServer() {
-  // Load from Firestore in the background so it doesn't block prompt port listening & dev server startup
-  loadDBFromFirestore().catch((err) => {
-    console.error("[Firestore] Background startup sync failed:", err);
-  });
+  // Await and initialize cloud database loading before server listening
+  await loadDBFromFirestore();
 
   if (process.env.NODE_ENV !== "production") {
     // Development mode

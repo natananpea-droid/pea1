@@ -6,24 +6,7 @@ import App from './App';
 // Dynamically inject the Google Maps API Script
 const loadGoogleMapsScript = () => {
   if (typeof window !== 'undefined' && !(window as any).google) {
-    let key = '';
-    
-    // Check import.meta.env for VITE variable
-    if (typeof import.meta !== 'undefined' && import.meta.env) {
-      key = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string) || '';
-    }
-    
-    // Fallback to process.env safely
-    if (!key) {
-      try {
-        if (typeof process !== 'undefined' && process.env) {
-          key = (process.env as any).GOOGLE_MAPS_API_KEY || '';
-        }
-      } catch (e) {
-        // Safe catch
-      }
-    }
-
+    const key = (process.env as any).GOOGLE_MAPS_API_KEY || '';
     const script = document.createElement('script');
     script.src = `https://maps.googleapis.com/maps/api/js?key=${key}&libraries=geometry,places`;
     script.async = true;
