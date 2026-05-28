@@ -5,6 +5,14 @@ import fs from "fs";
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
+import { initializeApp } from "firebase/app";
+import { getFirestore, collection, getDocs, doc, setDoc, deleteDoc, getDoc } from "firebase/firestore";
+
+// Initialize Firebase using the configuration credentials
+const firebaseConfigPath = path.join(process.cwd(), "firebase-applet-config.json");
+const firebaseConfig = JSON.parse(fs.readFileSync(firebaseConfigPath, "utf8"));
+const firebaseApp = initializeApp(firebaseConfig);
+const db = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
 
 // Standard Express + Http Server
 const app = express();
@@ -48,23 +56,51 @@ let lastUpdated = new Date().toISOString();
 
 const DB_FILE = path.join(process.cwd(), "db.json");
 
-function loadDB() {
+function saveDBLocalFallback() {
   try {
-    if (fs.existsSync(DB_FILE)) {
-      const content = fs.readFileSync(DB_FILE, "utf-8");
-      const parsed = JSON.parse(content);
-      if (parsed.patients) patients = parsed.patients;
-      if (parsed.plannedZone) plannedZone = parsed.plannedZone;
-      if (parsed.isSimulationEnabled !== undefined) isSimulationEnabled = parsed.isSimulationEnabled;
-      if (parsed.lastUpdated) {
-        lastUpdated = parsed.lastUpdated;
-      } else {
-        lastUpdated = new Date().toISOString();
-      }
-      console.log(`[DB] Loaded successfully with ${patients.length} patients. Last updated: ${lastUpdated}`);
+    fs.writeFileSync(DB_FILE, JSON.stringify({ patients, plannedZone, isSimulationEnabled, lastUpdated }, null, 2), "utf-8");
+  } catch (err) {
+    // Silently skip local fallback write glitches
+  }
+}
+
+async function loadDBFromFirestore() {
+  try {
+    console.log("[Firestore] Booting up, pulling latest data from cloud...");
+
+    // 1. Load settings (plannedZone, isSimulationEnabled)
+    const settingsDocRef = doc(db, "settings", "globalState");
+    const settingsSnap = await getDoc(settingsDocRef);
+    if (settingsSnap.exists()) {
+      const data = settingsSnap.data();
+      if (data.plannedZone) plannedZone = data.plannedZone;
+      if (data.isSimulationEnabled !== undefined) isSimulationEnabled = data.isSimulationEnabled;
+      if (data.lastUpdated) lastUpdated = data.lastUpdated;
+      console.log("[Firestore] Global settings loaded successfully:", { isSimulationEnabled, lastUpdated });
     } else {
-      // Setup mock / default patients if database is empty so the app has data initially
-      patients = [
+      // Setup initial settings document
+      await setDoc(settingsDocRef, {
+        plannedZone,
+        isSimulationEnabled,
+        lastUpdated: new Date().toISOString()
+      });
+      console.log("[Firestore] Created initial global settings document.");
+    }
+
+    // 2. Load patients
+    const patientsColRef = collection(db, "patients");
+    const patientsSnap = await getDocs(patientsColRef);
+    const loadedPatients: any[] = [];
+    patientsSnap.forEach((doc) => {
+      loadedPatients.push({ id: doc.id, ...doc.data() });
+    });
+
+    if (loadedPatients.length > 0) {
+      patients = loadedPatients;
+      console.log(`[Firestore] Synced successfully. Loaded ${patients.length} patients from cloud.`);
+    } else {
+      console.log("[Firestore] Cloud database is empty. Seeding initial fallback patients...");
+      const initialPatients = [
         {
           id: "pat_1",
           name: "นางมณี รัตนมงคล",
@@ -105,25 +141,50 @@ function loadDB() {
           lastUpdated: new Date().toISOString()
         }
       ];
-      lastUpdated = new Date().toISOString();
-      saveDB();
-      console.log("[DB] Created initial fallback DB configuration.");
+
+      for (const p of initialPatients) {
+        await setDoc(doc(db, "patients", p.id), p);
+      }
+      patients = initialPatients;
+      console.log(`[Firestore] Successfully seeded ${patients.length} patients and loaded in-memory.`);
     }
+
+    saveDBLocalFallback();
   } catch (err) {
-    console.error("[DB] Failed to load database:", err);
+    console.error("[Firestore] Initial load failed. Falling back to local/in-memory:", err);
   }
 }
 
-function saveDB() {
+async function savePatientToFirestore(patient: any) {
   try {
-    fs.writeFileSync(DB_FILE, JSON.stringify({ patients, plannedZone, isSimulationEnabled, lastUpdated }, null, 2), "utf-8");
+    await setDoc(doc(db, "patients", patient.id), patient);
+    console.log(`[Firestore] Saved patient ${patient.id} / ${patient.name}`);
   } catch (err) {
-    console.error("[DB] Failed to save database:", err);
+    console.error(`[Firestore] Failed to save patient ${patient.id}:`, err);
   }
 }
 
-// Immediately load database state at boot
-loadDB();
+async function deletePatientFromFirestore(patientId: string) {
+  try {
+    await deleteDoc(doc(db, "patients", patientId));
+    console.log(`[Firestore] Deleted patient ${patientId}`);
+  } catch (err) {
+    console.error(`[Firestore] Failed to delete patient ${patientId}:`, err);
+  }
+}
+
+async function saveSettingsToFirestore() {
+  try {
+    await setDoc(doc(db, "settings", "globalState"), {
+      plannedZone,
+      isSimulationEnabled,
+      lastUpdated
+    });
+    console.log("[Firestore] Global settings saved to cloud.");
+  } catch (err) {
+    console.error("[Firestore] Failed to save global settings:", err);
+  }
+}
 
 // WebSocket Server setups
 const wss = new WebSocketServer({ noServer: true });
@@ -176,35 +237,48 @@ wss.on("connection", (ws) => {
 
       if (type === "ACTION") {
         lastUpdated = new Date().toISOString();
-        switch (action) {
-          case "ADD_PATIENT":
-            patients = [data, ...patients];
-            saveDB();
-            broadcastFullState();
-            break;
-          case "UPDATE_PATIENT":
-            patients = patients.map(p => p.id === data.id ? { ...p, ...data, lastUpdated: new Date().toISOString() } : p);
-            saveDB();
-            broadcastFullState();
-            break;
-          case "DELETE_PATIENT":
-            patients = patients.filter(p => p.id !== data.id);
-            saveDB();
-            broadcastFullState();
-            break;
-          case "UPDATE_PLANNED_ZONE":
-            plannedZone = { ...plannedZone, ...data };
-            saveDB();
-            broadcastFullState();
-            break;
-          case "UPDATE_SIMULATION":
-            isSimulationEnabled = !!data.isSimulationEnabled;
-            saveDB();
-            broadcastFullState();
-            break;
-          default:
-            break;
-        }
+        const executeAction = async () => {
+          switch (action) {
+            case "ADD_PATIENT":
+              patients = [data, ...patients];
+              broadcastFullState();
+              saveDBLocalFallback();
+              await savePatientToFirestore(data);
+              await saveSettingsToFirestore();
+              break;
+            case "UPDATE_PATIENT": {
+              const updated = { ...data, lastUpdated: new Date().toISOString() };
+              patients = patients.map(p => p.id === data.id ? { ...p, ...updated } : p);
+              broadcastFullState();
+              saveDBLocalFallback();
+              await savePatientToFirestore(updated);
+              await saveSettingsToFirestore();
+              break;
+            }
+            case "DELETE_PATIENT":
+              patients = patients.filter(p => p.id !== data.id);
+              broadcastFullState();
+              saveDBLocalFallback();
+              await deletePatientFromFirestore(data.id);
+              await saveSettingsToFirestore();
+              break;
+            case "UPDATE_PLANNED_ZONE":
+              plannedZone = { ...plannedZone, ...data };
+              broadcastFullState();
+              saveDBLocalFallback();
+              await saveSettingsToFirestore();
+              break;
+            case "UPDATE_SIMULATION":
+              isSimulationEnabled = !!data.isSimulationEnabled;
+              broadcastFullState();
+              saveDBLocalFallback();
+              await saveSettingsToFirestore();
+              break;
+            default:
+              break;
+          }
+        };
+        executeAction().catch(e => console.error("Error executing action:", e));
       }
     } catch (err) {
       console.error("Failed to parse websocket message:", err);
@@ -213,7 +287,7 @@ wss.on("connection", (ws) => {
 });
 
 // Outage Simulator Loop (Server-authoritative, runs 100% synchronised!)
-setInterval(() => {
+setInterval(async () => {
   if (!isSimulationEnabled) return;
   if (Math.random() > 0.15) return; // 15% chance to disrupt one patient of normal status
 
@@ -226,17 +300,28 @@ setInterval(() => {
   const restorationTime = new Date();
   restorationTime.setMinutes(restorationTime.getMinutes() + durationMinutes);
 
-  patients = patients.map(p => p.id === targetId ? {
-    ...p,
-    status: "OUTAGE",
-    outageStartTime: new Date().toISOString(),
-    estimatedRestorationTime: restorationTime.toISOString(),
-    lastUpdated: new Date().toISOString()
-  } : p);
+  let updatedTarget: any = null;
+  patients = patients.map(p => {
+    if (p.id === targetId) {
+      updatedTarget = {
+        ...p,
+        status: "OUTAGE",
+        outageStartTime: new Date().toISOString(),
+        estimatedRestorationTime: restorationTime.toISOString(),
+        lastUpdated: new Date().toISOString()
+      };
+      return updatedTarget;
+    }
+    return p;
+  });
 
   lastUpdated = new Date().toISOString();
-  saveDB();
   broadcastFullState();
+  saveDBLocalFallback();
+  if (updatedTarget) {
+    await savePatientToFirestore(updatedTarget);
+  }
+  await saveSettingsToFirestore();
 }, 15000);
 
 // REST API to fetch full system state
@@ -250,7 +335,7 @@ app.get("/api/state", (req, res) => {
 });
 
 // REST API fallback for action syncing (highly reliable fallback when WebSockets are unstable or blocked)
-app.post("/api/actions", (req, res) => {
+app.post("/api/actions", async (req, res) => {
   const { action, data } = req.body;
   if (!action) {
     return res.status(400).json({ error: "Action is required" });
@@ -261,12 +346,17 @@ app.post("/api/actions", (req, res) => {
     switch (action) {
       case "ADD_PATIENT":
         patients = [data, ...patients];
+        await savePatientToFirestore(data);
         break;
-      case "UPDATE_PATIENT":
-        patients = patients.map(p => p.id === data.id ? { ...p, ...data, lastUpdated: new Date().toISOString() } : p);
+      case "UPDATE_PATIENT": {
+        const updated = { ...data, lastUpdated: new Date().toISOString() };
+        patients = patients.map(p => p.id === data.id ? { ...p, ...updated } : p);
+        await savePatientToFirestore(updated);
         break;
+      }
       case "DELETE_PATIENT":
         patients = patients.filter(p => p.id !== data.id);
+        await deletePatientFromFirestore(data.id);
         break;
       case "UPDATE_PLANNED_ZONE":
         plannedZone = { ...plannedZone, ...data };
@@ -278,9 +368,10 @@ app.post("/api/actions", (req, res) => {
         return res.status(400).json({ error: `Unknown action: ${action}` });
     }
 
-    saveDB();
+    await saveSettingsToFirestore();
+    saveDBLocalFallback();
     broadcastFullState();
-    return res.json({ success: true, message: `Action ${action} executed and broadcasted successfully.` });
+    return res.json({ success: true, message: `Action ${action} executed, saved to cloud, and broadcasted successfully.` });
   } catch (err: any) {
     console.error("Failed to execute REST API action:", err);
     return res.status(500).json({ error: "Internal server error" });
@@ -288,7 +379,7 @@ app.post("/api/actions", (req, res) => {
 });
 
 // REST API to restore whole database from client backup (robust peer persistence)
-app.post("/api/restore", (req, res) => {
+app.post("/api/restore", async (req, res) => {
   const { patients: clientPatients, plannedZone: clientPlannedZone, isSimulationEnabled: clientSim, lastUpdated: clientLastUpdated } = req.body;
   
   if (!clientPatients || !clientLastUpdated) {
@@ -305,9 +396,20 @@ app.post("/api/restore", (req, res) => {
     if (clientPlannedZone) plannedZone = clientPlannedZone;
     if (clientSim !== undefined) isSimulationEnabled = !!clientSim;
     lastUpdated = clientLastUpdated;
-    saveDB();
-    broadcastFullState();
-    return res.json({ success: true, message: "Database state restored successfully." });
+
+    try {
+      // Re-seed all patients in Firestore
+      for (const p of patients) {
+        await setDoc(doc(db, "patients", p.id), p);
+      }
+      await saveSettingsToFirestore();
+      saveDBLocalFallback();
+      broadcastFullState();
+      return res.json({ success: true, message: "Database state restored successfully." });
+    } catch (err) {
+      console.error("[RESTORE] Failed to restore to cloud database:", err);
+      return res.status(500).json({ error: "Failed to restore content to Firestore" });
+    }
   } else {
     return res.json({ success: false, message: "Server database is already up-to-date.", serverLastUpdated: lastUpdated });
   }
@@ -375,6 +477,9 @@ app.post("/api/assess", async (req, res) => {
 
 // Start integration with Vite/Production Server Assets
 async function configureServer() {
+  // Await and initialize cloud database loading before server listening
+  await loadDBFromFirestore();
+
   if (process.env.NODE_ENV !== "production") {
     // Development mode
     const vite = await createViteServer({

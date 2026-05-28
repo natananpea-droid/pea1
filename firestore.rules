@@ -1,0 +1,14 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Patients Collection Rules
+    match /patients/{patientId} {
+      allow read, write: if true;
+    }
+
+    // Settings Collection Rules
+    match /settings/{settingId} {
+      allow read, write: if true;
+    }
+  }
+}

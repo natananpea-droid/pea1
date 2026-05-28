@@ -1,0 +1,43 @@
+{
+  "entities": {
+    "Patient": {
+      "title": "Patient",
+      "description": "Patient status, medical conditions, and life support equipment for electricity disruption tracking.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "age": { "type": "number" },
+        "condition": { "type": "string" },
+        "contact": { "type": "string" },
+        "address": { "type": "string" },
+        "priority": { "type": "string" },
+        "status": { "type": "string" },
+        "lastUpdated": { "type": "string" },
+        "outageStartTime": { "type": "string" },
+        "estimatedRestorationTime": { "type": "string" }
+      },
+      "required": ["id", "name", "condition", "priority", "status"]
+    },
+    "GlobalSettings": {
+      "title": "GlobalSettings",
+      "description": "Global simulation controls and planned outage zone settings.",
+      "type": "object",
+      "properties": {
+        "isSimulationEnabled": { "type": "boolean" },
+        "lastUpdated": { "type": "string" }
+      },
+      "required": ["isSimulationEnabled", "lastUpdated"]
+    }
+  },
+  "firestore": {
+    "/patients/{patientId}": {
+      "schema": "Patient",
+      "description": "Vulnerable lifesupport-dependent patients tracked in Rayong PEA system."
+    },
+    "/settings/globalState": {
+      "schema": "GlobalSettings",
+      "description": "Global system parameters and live simulation configuration."
+    }
+  }
+}
