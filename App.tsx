@@ -8,8 +8,6 @@ import { assessPatientPriority } from './services/geminiService';
 import { Bell, Volume2, VolumeX, AlertTriangle, Crosshair } from 'lucide-react';
 import { initAuth, googleSignIn, logout, writePatientsToSheet, readPatientsFromSheet } from './services/sheetsService';
 
-const SPREADSHEET_ID = '11W01ZXTNRR3uZUHgsfpt7NwbPTiOAdOOZUvtKKOyLbM';
-
 const App: React.FC = () => {
   // Real-time synchronization states through Server-authoritative WebSocket
   const [patients, setPatients] = useState<Patient[]>([]);
@@ -32,6 +30,32 @@ const App: React.FC = () => {
   const [googleToken, setGoogleToken] = useState<string | null>(null);
   const [isSyncingSheet, setIsSyncingSheet] = useState(false);
   const [sheetSyncMessage, setSheetSyncMessage] = useState<string>('');
+
+  const [spreadsheetId, setSpreadsheetId] = useState(() => {
+    return localStorage.getItem('electriguard_spreadsheet_id') || '11W01ZXTNRR3uZUHgsfpt7NwbPTiOAdOOZUvtKKOyLbM';
+  });
+
+  const [spreadsheetInput, setSpreadsheetInput] = useState(() => {
+    const savedId = localStorage.getItem('electriguard_spreadsheet_id');
+    if (!savedId || savedId === '11W01ZXTNRR3uZUHgsfpt7NwbPTiOAdOOZUvtKKOyLbM') {
+      return 'https://docs.google.com/spreadsheets/d/11W01ZXTNRR3uZUHgsfpt7NwbPTiOAdOOZUvtKKOyLbM/edit';
+    }
+    return savedId;
+  });
+
+  const handleSheetIdChange = (val: string) => {
+    setSpreadsheetInput(val);
+    const trimmed = val.trim();
+    if (!trimmed) {
+      setSpreadsheetId('11W01ZXTNRR3uZUHgsfpt7NwbPTiOAdOOZUvtKKOyLbM');
+      localStorage.setItem('electriguard_spreadsheet_id', '11W01ZXTNRR3uZUHgsfpt7NwbPTiOAdOOZUvtKKOyLbM');
+      return;
+    }
+    const match = trimmed.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    const parsedId = (match && match[1]) ? match[1] : trimmed;
+    setSpreadsheetId(parsedId);
+    localStorage.setItem('electriguard_spreadsheet_id', parsedId);
+  };
 
   // Programmatic alarm tone synthesizer using Web Audio API
   const playOutageAlarm = useCallback(() => {
@@ -126,7 +150,7 @@ const App: React.FC = () => {
     try {
       setIsSyncingSheet(true);
       setSheetSyncMessage("🔄 กำลังดึงข้อมูลจาก Google Sheets...");
-      const sheetPatients = await readPatientsFromSheet(SPREADSHEET_ID, tokenToUse);
+      const sheetPatients = await readPatientsFromSheet(spreadsheetId, tokenToUse);
       
       if (sheetPatients && sheetPatients.length > 0) {
         console.log(`[Google Sheets] Found ${sheetPatients.length} patients in Google Sheets. Synchronizing...`);
@@ -154,7 +178,7 @@ const App: React.FC = () => {
         // Sheet has no records: let's export our currently active patients database to Google Sheets
         console.log("[Google Sheets] Google Sheets is currently empty. Seeding with current database...");
         setSheetSyncMessage("📤 ไม่พบรายชื่อข้อมูลในชีตระบบ จึงขอนำข้อมูลที่มีในขณะนี้สำรองขึ้น Google Sheets พิกัด...");
-        await writePatientsToSheet(SPREADSHEET_ID, tokenToUse, currentPatients);
+        await writePatientsToSheet(spreadsheetId, tokenToUse, currentPatients);
         setSheetSyncMessage("✅ สำรองข้อมูลโรงพยาบาลและผู้ป่วยจัดส่งขึ้น Google Sheets เรียบร้อย!");
       }
     } catch (err: any) {
@@ -164,7 +188,60 @@ const App: React.FC = () => {
       setIsSyncingSheet(false);
       setTimeout(() => setSheetSyncMessage(''), 5500);
     }
-  }, [plannedZone, isSimulationEnabled]);
+  }, [plannedZone, isSimulationEnabled, spreadsheetId]);
+
+  const handleExportToSheet = async () => {
+    if (!googleToken) return;
+    try {
+      setIsSyncingSheet(true);
+      setSheetSyncMessage("📤 กำลังส่งออกข้อมูลพิกัดขึ้น Google Sheets...");
+      await writePatientsToSheet(spreadsheetId, googleToken, patients);
+      setSheetSyncMessage("✅ อัปโหลดและเขียนข้อมูลลง Google Sheets เรียบร้อย!");
+    } catch (err: any) {
+      console.error("[Google Sheets] Export failed:", err);
+      setSheetSyncMessage(`❌ อัปโหลดล้มเหลว: ${err.message || err}`);
+    } finally {
+      setIsSyncingSheet(false);
+      setTimeout(() => setSheetSyncMessage(''), 5500);
+    }
+  };
+
+  const handleImportFromSheet = async () => {
+    if (!googleToken) return;
+    try {
+      setIsSyncingSheet(true);
+      setSheetSyncMessage("📥 กำลังดึงข้อมูลจาก Google Sheets...");
+      const sheetPatients = await readPatientsFromSheet(spreadsheetId, googleToken);
+      if (sheetPatients && sheetPatients.length > 0) {
+        // Push the entire registry list to our backend server
+        const res = await fetch("/api/restore", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            patients: sheetPatients,
+            plannedZone: plannedZone,
+            isSimulationEnabled: isSimulationEnabled,
+            lastUpdated: new Date().toISOString()
+          })
+        });
+        
+        if (res.ok) {
+          setPatients(sheetPatients);
+          setSheetSyncMessage("🚀 ดึงฐานข้อมูลผู้ป่วยจากแผ่นงานเข้ามาเรียบร้อย!");
+        } else {
+          setSheetSyncMessage("❌ ข้อผิดพลาดในการจัดเก็บเข้าคลาวด์เมนเฟรม");
+        }
+      } else {
+        setSheetSyncMessage("⚠️ ไม่พบข้อมูลผู้ป่วยใดๆ ในกระดาษแผ่นคำนวณที่ระบุ");
+      }
+    } catch (err: any) {
+      console.error("[Google Sheets] Import failed:", err);
+      setSheetSyncMessage(`❌ ดึงข้อมูลล้มเหลว: ${err.message || err}`);
+    } finally {
+      setIsSyncingSheet(false);
+      setTimeout(() => setSheetSyncMessage(''), 5500);
+    }
+  };
 
   const handleConnectGoogleSheets = async () => {
     try {
@@ -206,6 +283,22 @@ const App: React.FC = () => {
     );
     return () => unsubscribe();
   }, []);
+
+  // Automatically sync to Google Sheets silently whenever patients state is updated
+  useEffect(() => {
+    if (googleToken && patients && patients.length > 0 && !isSyncingSheet) {
+      const delaySync = setTimeout(() => {
+        writePatientsToSheet(spreadsheetId, googleToken, patients)
+          .then(() => {
+            console.log("[Google Sheets] Patient changes auto-saved to Google Sheets.");
+          })
+          .catch(err => {
+            console.error("[Google Sheets] Dynamic auto-sync write failed:", err);
+          });
+      }, 2500); // 2.5s debounce to avoid rate limits on continuous manual tweaks
+      return () => clearTimeout(delaySync);
+    }
+  }, [patients, googleToken, isSyncingSheet, spreadsheetId]);
 
   // Synchronise state from server with client's localStorage backup (peer cache fallback)
   const syncStateAndBackup = useCallback(async (serverData: any) => {
@@ -378,7 +471,7 @@ const App: React.FC = () => {
 
     // 3. Keep Google Sheets database in sync if connected
     if (googleToken && ['ADD_PATIENT', 'UPDATE_PATIENT', 'DELETE_PATIENT'].includes(action)) {
-      writePatientsToSheet(SPREADSHEET_ID, googleToken, updatedPatients)
+      writePatientsToSheet(spreadsheetId, googleToken, updatedPatients)
         .catch(err => console.error("[Google Sheets] Real-time sync update failed:", err));
     }
 
@@ -759,45 +852,79 @@ const App: React.FC = () => {
                 )}
 
                 {/* Google Sheets Sync Integration */}
-                <div className="flex items-center gap-1.5 bg-slate-800 rounded-xl p-1 border border-slate-700">
-                  {googleUser ? (
-                    <div className="flex items-center gap-2">
-                      <div className="flex flex-col text-right pl-2 leading-tight">
-                        <span className="text-[9px] text-emerald-400 font-black">📊 Google Sheets เชื่อมต่อ</span>
-                        <span className="text-[8px] text-slate-400 truncate max-w-[125px]" title={googleUser.email}>{googleUser.email}</span>
+                <div className="flex flex-col gap-1.5 bg-slate-800 rounded-xl p-1.5 border border-slate-700">
+                  <div className="flex items-center gap-1.5">
+                    {googleUser ? (
+                      <div className="flex items-center gap-1.5 w-full justify-between">
+                        <div className="flex flex-col text-left leading-tight pl-1">
+                          <span className="text-[9px] text-emerald-400 font-black">📊 Google Sheets เชื่อมต่อ</span>
+                          <span className="text-[8px] text-slate-400 truncate max-w-[100px]" title={googleUser.email}>{googleUser.email}</span>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={handleExportToSheet}
+                            disabled={isSyncingSheet}
+                            className="px-2 py-1 bg-emerald-600 hover:bg-emerald-500 disabled:bg-emerald-800 text-white rounded-lg text-[9px] font-black transition-all flex items-center gap-0.5 cursor-pointer animate-pulse"
+                            title="อัปโหลดส่งออกข้อมูลบนอุปกรณ์ขึ้น Google Sheets"
+                          >
+                            📤 ส่งออก
+                          </button>
+                          <button
+                            onClick={handleImportFromSheet}
+                            disabled={isSyncingSheet}
+                            className="px-2 py-1 bg-teal-600 hover:bg-teal-500 disabled:bg-teal-800 text-white rounded-lg text-[9px] font-black transition-all flex items-center gap-0.5 cursor-pointer"
+                            title="ดึงข้อมูลความเห็นจาก Google Sheets เข้าสู่เซิร์ฟเวอร์สำนักงาน"
+                          >
+                            📥 ดึงข้อมูล
+                          </button>
+                          <button
+                            onClick={handleDisconnectGoogleSheets}
+                            className="p-1 text-slate-400 hover:text-rose-400 rounded-lg transition-colors text-[10px] cursor-pointer"
+                            title="ตัดการเชื่อมต่อ Google Sheets"
+                          >
+                            ❌
+                          </button>
+                        </div>
                       </div>
+                    ) : (
                       <button
-                        onClick={() => syncWithGoogleSheet(googleToken!, patients)}
+                        onClick={handleConnectGoogleSheets}
                         disabled={isSyncingSheet}
-                        className="px-2 py-1 bg-emerald-600 hover:bg-emerald-500 disabled:bg-emerald-800 text-white rounded-lg text-[9px] font-black transition-all flex items-center gap-1 cursor-pointer"
-                        title="บังคับซิงค์ข้อมูลลงแผ่นคำนวณทันที"
+                        className="w-full px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-800 text-white rounded-lg text-[10px] font-black tracking-tight transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                        title="ล็อกอินด้วย Google เพื่อบันทึกประวัติผู้ป่วยลงแผ่นคำนวณอัตโนมัติ"
                       >
-                        {isSyncingSheet ? 'กำลังซิงค์...' : '🔄 ซิงค์ด่วน'}
+                        <svg viewBox="0 0 48 48" className="w-3.5 h-3.5 fill-current">
+                          <path d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
+                          <path d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
+                          <path d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
+                          <path d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
+                        </svg>
+                        {isSyncingSheet ? 'กำลังเชื่อมต่อ...' : 'เชื่อมต่อ Google Sheets 📊'}
                       </button>
-                      <button
-                        onClick={handleDisconnectGoogleSheets}
-                        className="p-1 text-slate-400 hover:text-rose-400 rounded-lg transition-colors text-[10px] cursor-pointer"
-                        title="ตัดการเชื่อมต่อ Google Sheets"
-                      >
-                        ❌
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      onClick={handleConnectGoogleSheets}
-                      disabled={isSyncingSheet}
-                      className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-800 text-white rounded-lg text-[10px] font-black tracking-tight transition-all flex items-center gap-1.5 cursor-pointer"
-                      title="ล็อกอินด้วย Google เพื่อบันทึกประวัติผู้ป่วยลงแผ่นคำนวณอัตโนมัติ"
-                    >
-                      <svg viewBox="0 0 48 48" className="w-3.5 h-3.5 fill-current">
-                        <path d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/>
-                        <path d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
-                        <path d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/>
-                        <path d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/>
-                      </svg>
-                      {isSyncingSheet ? 'กำลังเชื่อมต่อ...' : 'เชื่อมต่อ Google Sheets 📊'}
-                    </button>
-                  )}
+                    )}
+                  </div>
+
+                  {/* Input for Google Sheet ID or URL */}
+                  <div className="flex flex-col gap-1 border-t border-slate-700/60 pt-1.5 mt-0.5 w-full">
+                    <label className="text-[8px] text-slate-450 font-bold leading-normal flex justify-between">
+                      <span>🔗 ลิงก์หรือ ID ของ Google Sheets ของคุณ:</span>
+                      {spreadsheetId !== '11W01ZXTNRR3uZUHgsfpt7NwbPTiOAdOOZUvtKKOyLbM' && (
+                        <button
+                          onClick={() => handleSheetIdChange('https://docs.google.com/spreadsheets/d/11W01ZXTNRR3uZUHgsfpt7NwbPTiOAdOOZUvtKKOyLbM/edit')}
+                          className="text-amber-400 hover:underline hover:text-amber-300 font-extrabold cursor-pointer"
+                        >
+                          คืนค่าเริ่มต้น
+                        </button>
+                      )}
+                    </label>
+                    <input
+                      type="text"
+                      value={spreadsheetInput}
+                      onChange={(e) => handleSheetIdChange(e.target.value)}
+                      placeholder="วางลิงก์ Google Sheets ของคุณหรือชีตไอดี..."
+                      className="w-full bg-slate-900 border border-slate-705 rounded px-1.5 py-0.5 text-[9px] text-emerald-300 focus:outline-none focus:border-emerald-500 font-mono"
+                    />
+                  </div>
                 </div>
 
                 {/* Logout Button */}

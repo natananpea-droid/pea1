@@ -61,7 +61,8 @@ export async function getFirstSheetName(spreadsheetId: string, accessToken: stri
     headers: { Authorization: `Bearer ${accessToken}` },
   });
   if (!res.ok) {
-    throw new Error(`Failed to fetch spreadsheet metadata: ${res.statusText}`);
+    const errText = await res.text();
+    throw new Error(`Failed to fetch spreadsheet metadata: ${res.status} ${res.statusText} - ${errText}`);
   }
   const data = await res.json();
   if (data.sheets && data.sheets.length > 0) {
@@ -74,7 +75,8 @@ export async function writePatientsToSheet(spreadsheetId: string, accessToken: s
   const sheetName = await getFirstSheetName(spreadsheetId, accessToken);
   
   // 1. Clear the sheet first to prevent trailing old data
-  const clearUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(sheetName)}!A1:M1000:clear`;
+  const clearRange = `${sheetName}!A1:M1000`;
+  const clearUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(clearRange)}:clear`;
   const clearRes = await fetch(clearUrl, {
     method: 'POST',
     headers: { 
@@ -83,7 +85,8 @@ export async function writePatientsToSheet(spreadsheetId: string, accessToken: s
     },
   });
   if (!clearRes.ok) {
-    console.warn(`Could not clear sheet values: ${clearRes.statusText}`);
+    const clearErr = await clearRes.text();
+    console.warn(`Could not clear sheet values: ${clearRes.status} - ${clearErr}`);
   }
 
   // 2. Prepare headers and row values
@@ -120,7 +123,8 @@ export async function writePatientsToSheet(spreadsheetId: string, accessToken: s
   const values = [headers, ...rows];
 
   // 3. Put range
-  const putUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(sheetName)}!A1?valueInputOption=USER_ENTERED`;
+  const putRange = `${sheetName}!A1`;
+  const putUrl = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(putRange)}?valueInputOption=USER_ENTERED`;
   const response = await fetch(putUrl, {
     method: 'PUT',
     headers: {
@@ -131,18 +135,21 @@ export async function writePatientsToSheet(spreadsheetId: string, accessToken: s
   });
 
   if (!response.ok) {
-    throw new Error(`Failed to write to Google Sheets: ${response.statusText}`);
+    const putErr = await response.text();
+    throw new Error(`Failed to write to Google Sheets: ${response.status} ${response.statusText} - ${putErr}`);
   }
 }
 
 export async function readPatientsFromSheet(spreadsheetId: string, accessToken: string): Promise<any[]> {
   const sheetName = await getFirstSheetName(spreadsheetId, accessToken);
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(sheetName)}!A2:L1000`;
+  const readRange = `${sheetName}!A2:L1000`;
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(readRange)}`;
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
   if (!res.ok) {
-    throw new Error(`Failed to read Google Sheets values: ${res.statusText}`);
+    const readErr = await res.text();
+    throw new Error(`Failed to read Google Sheets values: ${res.status} ${res.statusText} - ${readErr}`);
   }
   const data = await res.json();
   if (!data.values || data.values.length === 0) {

@@ -3,6 +3,7 @@
   "appId": "1:761039393365:web:3967d44a04a75993ad3adc",
   "apiKey": "AIzaSyBjgaXeDWjXqx6tm6jdOxNAAB4B-3amHPY",
   "authDomain": "calm-pivot-b07pf.firebaseapp.com",
+  "firestoreDatabaseId": "ai-studio-a3891153-6458-49a3-87c9-6c0a961e29b1",
   "storageBucket": "calm-pivot-b07pf.firebasestorage.app",
   "messagingSenderId": "761039393365",
   "measurementId": ""
